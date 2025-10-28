@@ -42,7 +42,7 @@ make generate
 
 ```bash
 # Build and push (replace with your Docker Hub username)
-make docker-build docker-push IMG=kazem26/liqo-upgrade-controller:v0.2
+make docker-build docker-push IMG=kazem26/liqo-upgrade-controller:v0.1
 ```
 
 ### Step 3: Deploy to Cluster
@@ -52,7 +52,7 @@ make docker-build docker-push IMG=kazem26/liqo-upgrade-controller:v0.2
 make install
 
 # Deploy controller
-make deploy IMG=kazem26/liqo-upgrade-controller:v0.2
+make deploy IMG=kazem26/liqo-upgrade-controller:v0.1
 
 # Verify controller is running
 kubectl get pods -n liqo-upgrade-controller-system
