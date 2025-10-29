@@ -42,13 +42,18 @@ type LiqoUpgradeReconciler struct {
 }
 
 const (
-	finalizerName = "upgrade.liqo.io/finalizer"
-	jobNamePrefix = "liqo-upgrade-crd"
+	finalizerName     = "upgrade.liqo.io/finalizer"
+	backupJobPrefix   = "liqo-backup"
+	upgradeJobPrefix  = "liqo-upgrade-crd"
+	verifyJobPrefix   = "liqo-verify-crd"
+	rollbackJobPrefix = "liqo-rollback-crd"
 )
 
 // +kubebuilder:rbac:groups=upgrade.liqo.io,resources=liqoupgrades,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=upgrade.liqo.io,resources=liqoupgrades/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=upgrade.liqo.io,resources=liqoupgrades/finalizers,verbs=update
+// +kubebuilder:rbac:groups=upgrade.liqo.io,resources=liqoupgradebackups,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=upgrade.liqo.io,resources=liqoupgradebackups/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
@@ -81,11 +86,20 @@ func (r *LiqoUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// State machine based on current phase
+	logger.Info("Reconciling upgrade", "currentPhase", upgrade.Status.Phase)
+
 	switch upgrade.Status.Phase {
 	case "":
-		return r.startCRDUpgrade(ctx, upgrade)
+		logger.Info("Phase is empty, starting backup")
+		return r.startBackup(ctx, upgrade)
+	case upgradev1alpha1.PhaseBackup:
+		return r.monitorBackup(ctx, upgrade)
 	case upgradev1alpha1.PhaseCRDs:
 		return r.monitorCRDUpgrade(ctx, upgrade)
+	case upgradev1alpha1.PhaseVerifyingCRDs:
+		return r.monitorCRDVerification(ctx, upgrade)
+	case upgradev1alpha1.PhaseRollingBack:
+		return r.monitorRollback(ctx, upgrade)
 	case upgradev1alpha1.PhaseCompleted:
 		logger.Info("Upgrade completed successfully")
 		return ctrl.Result{}, nil
@@ -98,11 +112,58 @@ func (r *LiqoUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 }
 
+// startBackup creates a backup job
+func (r *LiqoUpgradeReconciler) startBackup(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	logger.Info("Starting backup phase", "version", upgrade.Spec.CurrentVersion)
+
+	// Create backup job
+	job := r.buildBackupJob(upgrade)
+	if err := controllerutil.SetControllerReference(upgrade, job, r.Scheme); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.Create(ctx, job); err != nil {
+		if !errors.IsAlreadyExists(err) {
+			logger.Error(err, "Failed to create backup job")
+			return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, "Failed to create backup job", nil)
+		}
+	}
+
+	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseBackup, "Creating backup of current state", nil)
+}
+
+// monitorBackup monitors the backup job
+func (r *LiqoUpgradeReconciler) monitorBackup(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	jobName := fmt.Sprintf("%s-%s", backupJobPrefix, upgrade.Name)
+	job := &batchv1.Job{}
+	if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: upgrade.Namespace}, job); err != nil {
+		logger.Error(err, "Failed to get backup job")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	if job.Status.Succeeded > 0 {
+		logger.Info("Backup completed successfully")
+		// Start CRD upgrade
+		return r.startCRDUpgrade(ctx, upgrade)
+	}
+
+	if job.Status.Failed > 0 {
+		logger.Info("Backup failed")
+		return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, "Backup job failed", nil)
+	}
+
+	logger.Info("Backup job still running")
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// startCRDUpgrade starts the CRD upgrade after backup
 func (r *LiqoUpgradeReconciler) startCRDUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	logger.Info("Starting CRD upgrade phase", "from", upgrade.Spec.CurrentVersion, "to", upgrade.Spec.TargetVersion)
+	logger.Info("Starting CRD upgrade phase")
 
-	// Create the Job to upgrade CRDs
 	job := r.buildCRDUpgradeJob(upgrade)
 	if err := controllerutil.SetControllerReference(upgrade, job, r.Scheme); err != nil {
 		return ctrl.Result{}, err
@@ -111,48 +172,216 @@ func (r *LiqoUpgradeReconciler) startCRDUpgrade(ctx context.Context, upgrade *up
 	if err := r.Create(ctx, job); err != nil {
 		if !errors.IsAlreadyExists(err) {
 			logger.Error(err, "Failed to create CRD upgrade job")
-			return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, "Failed to create CRD upgrade job")
+			return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, "Failed to create CRD upgrade job", nil)
 		}
 	}
 
-	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseCRDs, "CRD upgrade job created")
+	statusUpdates := map[string]interface{}{
+		"backupReady": true,
+		"backupName":  fmt.Sprintf("%s-%s", backupJobPrefix, upgrade.Name),
+	}
+	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseCRDs, "CRD upgrade job created", statusUpdates)
 }
 
+// monitorCRDUpgrade monitors the CRD upgrade job
 func (r *LiqoUpgradeReconciler) monitorCRDUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Get the Job
-	jobName := fmt.Sprintf("%s-%s", jobNamePrefix, upgrade.Name)
+	jobName := fmt.Sprintf("%s-%s", upgradeJobPrefix, upgrade.Name)
 	job := &batchv1.Job{}
 	if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: upgrade.Namespace}, job); err != nil {
 		logger.Error(err, "Failed to get CRD upgrade job")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// Check Job status
 	if job.Status.Succeeded > 0 {
-		logger.Info("CRD upgrade completed successfully")
-		return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseCompleted, "CRD upgrade completed successfully")
+		logger.Info("CRD upgrade completed, starting verification")
+		return r.startCRDVerification(ctx, upgrade)
 	}
 
 	if job.Status.Failed > 0 {
-		logger.Info("CRD upgrade failed")
-		return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, "CRD upgrade job failed - check job logs for details")
+		logger.Info("CRD upgrade failed, initiating rollback")
+		return r.startRollback(ctx, upgrade, "CRD upgrade job failed")
 	}
 
-	// Job still running
 	logger.Info("CRD upgrade job still running")
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
-func (r *LiqoUpgradeReconciler) buildCRDUpgradeJob(upgrade *upgradev1alpha1.LiqoUpgrade) *batchv1.Job {
-	jobName := fmt.Sprintf("%s-%s", jobNamePrefix, upgrade.Name)
+// startCRDVerification starts health check verification
+func (r *LiqoUpgradeReconciler) startCRDVerification(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	logger.Info("Starting CRD verification")
+
+	job := r.buildVerificationJob(upgrade)
+	if err := controllerutil.SetControllerReference(upgrade, job, r.Scheme); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.Create(ctx, job); err != nil {
+		if !errors.IsAlreadyExists(err) {
+			logger.Error(err, "Failed to create verification job")
+			return r.startRollback(ctx, upgrade, "Failed to create verification job")
+		}
+	}
+
+	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseVerifyingCRDs, "Verifying CRD upgrade", nil)
+}
+
+// monitorCRDVerification monitors the verification job
+func (r *LiqoUpgradeReconciler) monitorCRDVerification(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	jobName := fmt.Sprintf("%s-%s", verifyJobPrefix, upgrade.Name)
+	job := &batchv1.Job{}
+	if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: upgrade.Namespace}, job); err != nil {
+		logger.Error(err, "Failed to get verification job")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	if job.Status.Succeeded > 0 {
+		logger.Info("Verification passed, Phase 1 complete!")
+		statusUpdates := map[string]interface{}{
+			"lastSuccessfulPhase": upgradev1alpha1.PhaseCRDs,
+		}
+		return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseCompleted, "Phase 1 (CRD upgrade) completed successfully", statusUpdates)
+	}
+
+	if job.Status.Failed > 0 {
+		logger.Info("Verification failed, initiating rollback")
+		return r.startRollback(ctx, upgrade, "CRD verification failed")
+	}
+
+	logger.Info("Verification job still running")
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// startRollback initiates rollback process
+func (r *LiqoUpgradeReconciler) startRollback(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade, reason string) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	logger.Info("Starting rollback", "reason", reason)
+
+	job := r.buildRollbackJob(upgrade)
+	if err := controllerutil.SetControllerReference(upgrade, job, r.Scheme); err != nil {
+		logger.Error(err, "Failed to set controller reference for rollback job")
+		return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, fmt.Sprintf("Rollback preparation failed: %s", err.Error()), nil)
+	}
+
+	if err := r.Create(ctx, job); err != nil {
+		if errors.IsAlreadyExists(err) {
+			logger.Info("Rollback job already exists, monitoring it")
+			return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseRollingBack, fmt.Sprintf("Rolling back due to: %s", reason), nil)
+		}
+		logger.Error(err, "Failed to create rollback job")
+		return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, fmt.Sprintf("Rollback failed to start: %s | Original failure: %s", err.Error(), reason), nil)
+	}
+
+	logger.Info("Rollback job created successfully")
+	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseRollingBack, fmt.Sprintf("Rolling back due to: %s", reason), nil)
+}
+
+// monitorRollback monitors the rollback job
+func (r *LiqoUpgradeReconciler) monitorRollback(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	jobName := fmt.Sprintf("%s-%s", rollbackJobPrefix, upgrade.Name)
+	job := &batchv1.Job{}
+	if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: upgrade.Namespace}, job); err != nil {
+		logger.Error(err, "Failed to get rollback job")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	if job.Status.Succeeded > 0 {
+		logger.Info("Rollback completed successfully")
+		statusUpdates := map[string]interface{}{
+			"rolledBack": true,
+		}
+		return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, "Upgrade failed and rolled back successfully", statusUpdates)
+	}
+
+	if job.Status.Failed > 0 {
+		logger.Info("Rollback failed!")
+		statusUpdates := map[string]interface{}{
+			"rolledBack": false,
+		}
+		return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, "Upgrade failed AND rollback failed - manual intervention required", statusUpdates)
+	}
+
+	logger.Info("Rollback job still running")
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// buildBackupJob creates the backup job
+func (r *LiqoUpgradeReconciler) buildBackupJob(upgrade *upgradev1alpha1.LiqoUpgrade) *batchv1.Job {
+	jobName := fmt.Sprintf("%s-%s", backupJobPrefix, upgrade.Name)
 	namespace := upgrade.Namespace
 	if namespace == "" {
 		namespace = "default"
 	}
 
-	// Smart upgrade script with version validation
+	backupScript := `#!/bin/bash
+set -e
+
+BACKUP_DIR="/tmp/backup"
+mkdir -p "$BACKUP_DIR"
+
+echo "========================================="
+echo "Backing up Liqo CRDs"
+echo "========================================="
+
+# Get list of all Liqo CRDs
+LIQO_CRDS=$(kubectl get crd | grep liqo | awk '{print $1}')
+
+echo "Found $(echo "$LIQO_CRDS" | wc -l) Liqo CRDs to backup"
+
+# Backup each CRD
+for crd in $LIQO_CRDS; do
+    echo "Backing up: $crd"
+    kubectl get crd "$crd" -o yaml > "$BACKUP_DIR/$crd.yaml"
+done
+
+echo ""
+echo "✅ Backup completed successfully!"
+echo "Backed up $(ls -1 $BACKUP_DIR/*.yaml | wc -l) CRDs"
+`
+
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName,
+			Namespace: namespace,
+		},
+		Spec: batchv1.JobSpec{
+			TTLSecondsAfterFinished: int32Ptr(300), // Auto-delete 5 minutes after completion
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					ServiceAccountName: "liqo-upgrade-controller",
+					RestartPolicy:      corev1.RestartPolicyNever,
+					Containers: []corev1.Container{
+						{
+							Name:    "backup-crds",
+							Image:   "bitnami/kubectl:latest",
+							Command: []string{"/bin/bash"},
+							Args:    []string{"-c", backupScript},
+						},
+					},
+				},
+			},
+			BackoffLimit: int32Ptr(0),
+		},
+	}
+
+	return job
+}
+
+// buildCRDUpgradeJob creates the CRD upgrade job (same as before but enhanced)
+func (r *LiqoUpgradeReconciler) buildCRDUpgradeJob(upgrade *upgradev1alpha1.LiqoUpgrade) *batchv1.Job {
+	jobName := fmt.Sprintf("%s-%s", upgradeJobPrefix, upgrade.Name)
+	namespace := upgrade.Namespace
+	if namespace == "" {
+		namespace = "default"
+	}
+
+	// Same smart upgrade script as before
 	smartUpgradeScript := `#!/bin/bash
 set -e
 
@@ -168,15 +397,11 @@ echo ""
 # Step 0: Detect actual version from cluster
 echo "Step 0: Validating current version..."
 
-# Try to get version from liqo-controller-manager image tag
 CONTROLLER_IMAGE=$(kubectl get deployment liqo-controller-manager -n liqo -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
 
 if [ -n "$CONTROLLER_IMAGE" ]; then
-    # Extract version using parameter expansion (works in any POSIX shell)
-    # Remove everything before the last colon
     ACTUAL_VERSION="${CONTROLLER_IMAGE##*:}"
     
-    # Verify we got a version-like string (starts with 'v' and contains numbers)
     if ! echo "$ACTUAL_VERSION" | grep -q "^v[0-9]"; then
         ACTUAL_VERSION="unknown"
     fi
@@ -186,6 +411,7 @@ fi
 
 echo "  User specified: ${CURRENT_VERSION}"
 echo "  Cluster has: ${ACTUAL_VERSION}"
+echo "  Debug - Full image: ${CONTROLLER_IMAGE}"
 
 if [ -z "$ACTUAL_VERSION" ] || [ "$ACTUAL_VERSION" = "unknown" ]; then
     echo ""
@@ -224,12 +450,10 @@ download_and_hash() {
     sha256sum "$output_file" | awk '{print $1}'
 }
 
-# Create temp directories
 mkdir -p /tmp/crds/current
 mkdir -p /tmp/crds/target
 mkdir -p /tmp/crds/changed
 
-# Get CRD lists
 echo "Step 1: Fetching CRD lists from GitHub..."
 CURRENT_CRDS=$(get_crd_list "$CURRENT_VERSION")
 TARGET_CRDS=$(get_crd_list "$TARGET_VERSION")
@@ -244,7 +468,6 @@ if [ -z "$TARGET_CRDS" ]; then
     exit 1
 fi
 
-# Merge and deduplicate CRD names
 ALL_CRDS=$(echo -e "${CURRENT_CRDS}\n${TARGET_CRDS}" | sort -u)
 
 echo "  Found $(echo "$ALL_CRDS" | wc -l) unique CRDs"
@@ -258,7 +481,6 @@ REMOVED_COUNT=0
 for crd in $ALL_CRDS; do
     echo "  Checking: $crd"
     
-    # Check if CRD exists in current version
     if echo "$CURRENT_CRDS" | grep -q "^${crd}$"; then
         HAS_CURRENT=true
         CURRENT_HASH=$(download_and_hash "$CURRENT_VERSION" "$crd" "/tmp/crds/current/${crd}")
@@ -268,7 +490,6 @@ for crd in $ALL_CRDS; do
         NEW_COUNT=$((NEW_COUNT + 1))
     fi
     
-    # Check if CRD exists in target version
     if echo "$TARGET_CRDS" | grep -q "^${crd}$"; then
         HAS_TARGET=true
         TARGET_HASH=$(download_and_hash "$TARGET_VERSION" "$crd" "/tmp/crds/target/${crd}")
@@ -279,7 +500,6 @@ for crd in $ALL_CRDS; do
         continue
     fi
     
-    # Compare hashes if both exist
     if [ "$HAS_CURRENT" = true ] && [ "$HAS_TARGET" = true ]; then
         if [ "$CURRENT_HASH" != "$TARGET_HASH" ]; then
             echo "    → CHANGED (adding to upgrade list)"
@@ -289,7 +509,6 @@ for crd in $ALL_CRDS; do
             echo "    → No changes"
         fi
     elif [ "$HAS_TARGET" = true ]; then
-        # New CRD, add to changed list
         cp "/tmp/crds/target/${crd}" "/tmp/crds/changed/${crd}"
     fi
 done
@@ -302,7 +521,6 @@ echo "  - New CRDs: $NEW_COUNT"
 echo "  - Removed CRDs: $REMOVED_COUNT"
 echo "========================================="
 
-# Apply only changed CRDs
 if [ $CHANGED_COUNT -gt 0 ] || [ $NEW_COUNT -gt 0 ]; then
     echo ""
     echo "Step 3: Applying changed/new CRDs..."
@@ -312,14 +530,19 @@ if [ $CHANGED_COUNT -gt 0 ] || [ $NEW_COUNT -gt 0 ]; then
             crd_name=$(basename "$crd_file")
             echo "  Applying: $crd_name"
             
-            # Try regular apply first
-            if ! kubectl apply -f "$crd_file" 2>&1 | tee /tmp/apply_output.log | grep -q "Too long"; then
-                # Apply succeeded
+            # Try regular apply first, capture output and exit code
+            if kubectl apply -f "$crd_file" > /tmp/apply_output.log 2>&1; then
                 echo "    ✓ Applied successfully"
             else
-                # Annotation too large, use server-side apply
-                echo "    → Annotation too large, using server-side apply"
-                kubectl apply -f "$crd_file" --server-side --force-conflicts
+                # Check if failure was due to annotation size
+                if grep -q "Too long" /tmp/apply_output.log || grep -q "metadata.annotations" /tmp/apply_output.log; then
+                    echo "    → Annotation too large, using server-side apply"
+                    kubectl apply -f "$crd_file" --server-side --force-conflicts
+                else
+                    echo "    ❌ Apply failed with unexpected error:"
+                    cat /tmp/apply_output.log
+                    exit 1
+                fi
             fi
         fi
     done
@@ -342,6 +565,7 @@ kubectl get crds | grep liqo || true
 			Namespace: namespace,
 		},
 		Spec: batchv1.JobSpec{
+			TTLSecondsAfterFinished: int32Ptr(300), // Auto-delete 5 minutes after completion
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					ServiceAccountName: "liqo-upgrade-controller",
@@ -356,17 +580,203 @@ kubectl get crds | grep liqo || true
 					},
 				},
 			},
-			BackoffLimit: int32Ptr(0), // No retries - fail immediately on error
+			BackoffLimit: int32Ptr(0),
 		},
 	}
 
 	return job
 }
 
-func (r *LiqoUpgradeReconciler) updateStatus(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade, phase upgradev1alpha1.UpgradePhase, message string) (ctrl.Result, error) {
+// buildVerificationJob creates the verification job
+func (r *LiqoUpgradeReconciler) buildVerificationJob(upgrade *upgradev1alpha1.LiqoUpgrade) *batchv1.Job {
+	jobName := fmt.Sprintf("%s-%s", verifyJobPrefix, upgrade.Name)
+	namespace := upgrade.Namespace
+	if namespace == "" {
+		namespace = "default"
+	}
+
+	verificationScript := `#!/bin/bash
+set -e
+
+echo "========================================="
+echo "Verifying CRD Upgrade"
+echo "========================================="
+echo ""
+
+# Step 1: Verify all Liqo CRDs exist
+echo "Step 1: Checking all Liqo CRDs exist..."
+LIQO_CRDS=$(kubectl get crd | grep liqo | wc -l)
+echo "  Found $LIQO_CRDS Liqo CRDs"
+
+if [ "$LIQO_CRDS" -lt 25 ]; then
+    echo "  ❌ ERROR: Expected at least 25 Liqo CRDs, found $LIQO_CRDS"
+    exit 1
+fi
+
+echo "  ✅ CRD count looks good"
+echo ""
+
+# Step 2: Verify CRDs are valid (can be retrieved)
+echo "Step 2: Verifying CRDs are valid..."
+INVALID_CRDS=0
+
+for crd in $(kubectl get crd | grep liqo | awk '{print $1}'); do
+    if ! kubectl get crd "$crd" > /dev/null 2>&1; then
+        echo "  ❌ ERROR: CRD $crd is invalid"
+        INVALID_CRDS=$((INVALID_CRDS + 1))
+    fi
+done
+
+if [ $INVALID_CRDS -gt 0 ]; then
+    echo "  ❌ ERROR: Found $INVALID_CRDS invalid CRDs"
+    exit 1
+fi
+
+echo "  ✅ All CRDs are valid"
+echo ""
+
+# Step 3: Check if existing resources still exist
+echo "Step 3: Verifying existing resources..."
+
+# Check ForeignClusters (if any)
+FC_COUNT=$(kubectl get foreignclusters.core.liqo.io -A 2>/dev/null | grep -v NAME | wc -l || echo "0")
+echo "  Found $FC_COUNT ForeignCluster resources"
+
+# Check if liqo-controller-manager is running
+echo ""
+echo "Step 4: Verifying Liqo components..."
+if kubectl get deployment liqo-controller-manager -n liqo > /dev/null 2>&1; then
+    READY=$(kubectl get deployment liqo-controller-manager -n liqo -o jsonpath='{.status.readyReplicas}')
+    if [ "$READY" -ge 1 ]; then
+        echo "  ✅ liqo-controller-manager is running"
+    else
+        echo "  ⚠️  WARNING: liqo-controller-manager is not ready"
+    fi
+fi
+
+echo ""
+echo "========================================="
+echo "✅ Verification Passed!"
+echo "========================================="
+`
+
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName,
+			Namespace: namespace,
+		},
+		Spec: batchv1.JobSpec{
+			TTLSecondsAfterFinished: int32Ptr(300), // Auto-delete 5 minutes after completion
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					ServiceAccountName: "liqo-upgrade-controller",
+					RestartPolicy:      corev1.RestartPolicyNever,
+					Containers: []corev1.Container{
+						{
+							Name:    "verify-crds",
+							Image:   "bitnami/kubectl:latest",
+							Command: []string{"/bin/bash"},
+							Args:    []string{"-c", verificationScript},
+						},
+					},
+				},
+			},
+			BackoffLimit: int32Ptr(0),
+		},
+	}
+
+	return job
+}
+
+// buildRollbackJob creates the rollback job
+func (r *LiqoUpgradeReconciler) buildRollbackJob(upgrade *upgradev1alpha1.LiqoUpgrade) *batchv1.Job {
+	jobName := fmt.Sprintf("%s-%s", rollbackJobPrefix, upgrade.Name)
+	namespace := upgrade.Namespace
+	if namespace == "" {
+		namespace = "default"
+	}
+
+	rollbackScript := `#!/bin/bash
+set -e
+
+BACKUP_DIR="/tmp/backup"
+
+echo "========================================="
+echo "Rolling Back CRDs"
+echo "========================================="
+echo ""
+
+if [ ! -d "$BACKUP_DIR" ] || [ -z "$(ls -A $BACKUP_DIR/*.yaml 2>/dev/null)" ]; then
+    echo "❌ ERROR: No backup found at $BACKUP_DIR"
+    echo "Cannot rollback without backup!"
+    exit 1
+fi
+
+echo "Found backup with $(ls -1 $BACKUP_DIR/*.yaml | wc -l) CRDs"
+echo ""
+echo "Restoring CRDs from backup..."
+
+for crd_file in $BACKUP_DIR/*.yaml; do
+    crd_name=$(basename "$crd_file" .yaml)
+    echo "  Restoring: $crd_name"
+    kubectl apply -f "$crd_file" --server-side --force-conflicts
+done
+
+echo ""
+echo "✅ Rollback completed successfully!"
+echo ""
+echo "Verifying rollback..."
+kubectl get crds | grep liqo || true
+`
+
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName,
+			Namespace: namespace,
+		},
+		Spec: batchv1.JobSpec{
+			TTLSecondsAfterFinished: int32Ptr(300), // Auto-delete 5 minutes after completion
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					ServiceAccountName: "liqo-upgrade-controller",
+					RestartPolicy:      corev1.RestartPolicyNever,
+					Containers: []corev1.Container{
+						{
+							Name:    "rollback-crds",
+							Image:   "bitnami/kubectl:latest",
+							Command: []string{"/bin/bash"},
+							Args:    []string{"-c", rollbackScript},
+						},
+					},
+				},
+			},
+			BackoffLimit: int32Ptr(0),
+		},
+	}
+
+	return job
+}
+
+func (r *LiqoUpgradeReconciler) updateStatus(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade, phase upgradev1alpha1.UpgradePhase, message string, additionalUpdates map[string]interface{}) (ctrl.Result, error) {
 	upgrade.Status.Phase = phase
 	upgrade.Status.Message = message
 	upgrade.Status.LastUpdated = metav1.Now()
+
+	// Apply additional status updates
+	if additionalUpdates != nil {
+		if backupReady, ok := additionalUpdates["backupReady"].(bool); ok {
+			upgrade.Status.BackupReady = backupReady
+		}
+		if backupName, ok := additionalUpdates["backupName"].(string); ok {
+			upgrade.Status.BackupName = backupName
+		}
+		if lastSuccessfulPhase, ok := additionalUpdates["lastSuccessfulPhase"].(upgradev1alpha1.UpgradePhase); ok {
+			upgrade.Status.LastSuccessfulPhase = lastSuccessfulPhase
+		}
+		if rolledBack, ok := additionalUpdates["rolledBack"].(bool); ok {
+			upgrade.Status.RolledBack = rolledBack
+		}
+	}
 
 	if err := r.Status().Update(ctx, upgrade); err != nil {
 		return ctrl.Result{}, err
@@ -379,13 +789,16 @@ func (r *LiqoUpgradeReconciler) handleDeletion(ctx context.Context, upgrade *upg
 	logger := log.FromContext(ctx)
 
 	if controllerutil.ContainsFinalizer(upgrade, finalizerName) {
-		// Cleanup: Delete the Job if it exists
-		jobName := fmt.Sprintf("%s-%s", jobNamePrefix, upgrade.Name)
-		job := &batchv1.Job{}
-		err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: upgrade.Namespace}, job)
-		if err == nil {
-			if err := r.Delete(ctx, job); err != nil {
-				logger.Error(err, "Failed to delete upgrade job")
+		// Cleanup: Delete all jobs if they exist
+		jobPrefixes := []string{backupJobPrefix, upgradeJobPrefix, verifyJobPrefix, rollbackJobPrefix}
+		for _, prefix := range jobPrefixes {
+			jobName := fmt.Sprintf("%s-%s", prefix, upgrade.Name)
+			job := &batchv1.Job{}
+			err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: upgrade.Namespace}, job)
+			if err == nil {
+				if err := r.Delete(ctx, job); err != nil {
+					logger.Error(err, "Failed to delete job", "jobName", jobName)
+				}
 			}
 		}
 

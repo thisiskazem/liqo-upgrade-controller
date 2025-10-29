@@ -44,6 +44,7 @@ rules:
 - apiGroups:
   - upgrade.liqo.io
   resources:
+  - liqoupgradebackups
   - liqoupgrades
   verbs:
   - create
@@ -56,14 +57,15 @@ rules:
 - apiGroups:
   - upgrade.liqo.io
   resources:
-  - liqoupgrades/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - upgrade.liqo.io
-  resources:
+  - liqoupgradebackups/status
   - liqoupgrades/status
   verbs:
   - get
   - patch
+  - update
+- apiGroups:
+  - upgrade.liqo.io
+  resources:
+  - liqoupgrades/finalizers
+  verbs:
   - update

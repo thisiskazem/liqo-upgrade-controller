@@ -43,8 +43,14 @@ const (
 	// PhaseNone means upgrade hasn't started
 	PhaseNone UpgradePhase = ""
 
+	// PhaseBackup means we're creating backup
+	PhaseBackup UpgradePhase = "CreatingBackup"
+
 	// PhaseCRDs means we're upgrading CRDs
 	PhaseCRDs UpgradePhase = "UpgradingCRDs"
+
+	// PhaseVerifyingCRDs means we're verifying CRDs after upgrade
+	PhaseVerifyingCRDs UpgradePhase = "VerifyingCRDs"
 
 	// PhaseControlPlane means we're upgrading control plane components
 	PhaseControlPlane UpgradePhase = "UpgradingControlPlane"
@@ -54,6 +60,9 @@ const (
 
 	// PhaseVerification means we're verifying the upgrade
 	PhaseVerification UpgradePhase = "Verifying"
+
+	// PhaseRollingBack means we're rolling back
+	PhaseRollingBack UpgradePhase = "RollingBack"
 
 	// PhaseCompleted means upgrade succeeded
 	PhaseCompleted UpgradePhase = "Completed"
@@ -75,6 +84,26 @@ type LiqoUpgradeStatus struct {
 	// LastUpdated is the timestamp of the last status update
 	// +optional
 	LastUpdated metav1.Time `json:"lastUpdated,omitempty"`
+
+	// BackupName references the backup created before upgrade
+	// +optional
+	BackupName string `json:"backupName,omitempty"`
+
+	// BackupReady indicates if backup is available for rollback
+	// +optional
+	BackupReady bool `json:"backupReady,omitempty"`
+
+	// LastSuccessfulPhase is the last phase that completed successfully
+	// +optional
+	LastSuccessfulPhase UpgradePhase `json:"lastSuccessfulPhase,omitempty"`
+
+	// RolledBack indicates if this upgrade was rolled back
+	// +optional
+	RolledBack bool `json:"rolledBack,omitempty"`
+
+	// PeeringHealthy indicates if peering is healthy (for multi-cluster)
+	// +optional
+	PeeringHealthy *bool `json:"peeringHealthy,omitempty"`
 
 	// conditions represent the current state of the LiqoUpgrade resource
 	// +listType=map

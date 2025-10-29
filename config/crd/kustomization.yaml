@@ -3,6 +3,8 @@
 # It should be run by config/default
 resources:
 - bases/upgrade.liqo.io_liqoupgrades.yaml
+- bases/upgrade.liqo.io_liqoupgradebackups.yaml
+
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

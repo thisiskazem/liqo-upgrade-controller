@@ -69,6 +69,12 @@ spec:
           status:
             description: LiqoUpgradeStatus defines the observed state of LiqoUpgrade
             properties:
+              backupName:
+                description: BackupName references the backup created before upgrade
+                type: string
+              backupReady:
+                description: BackupReady indicates if backup is available for rollback
+                type: boolean
               conditions:
                 description: conditions represent the current state of the LiqoUpgrade
                   resource
@@ -130,6 +136,10 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              lastSuccessfulPhase:
+                description: LastSuccessfulPhase is the last phase that completed
+                  successfully
+                type: string
               lastUpdated:
                 description: LastUpdated is the timestamp of the last status update
                 format: date-time
@@ -138,9 +148,15 @@ spec:
                 description: Message provides human-readable details about the current
                   phase
                 type: string
+              peeringHealthy:
+                description: PeeringHealthy indicates if peering is healthy (for multi-cluster)
+                type: boolean
               phase:
                 description: Phase indicates the current phase of the upgrade
                 type: string
+              rolledBack:
+                description: RolledBack indicates if this upgrade was rolled back
+                type: boolean
             type: object
         required:
         - spec
