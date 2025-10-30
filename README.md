@@ -1,349 +1,379 @@
-# Liqo Upgrade Controller - Phase 1 Complete ✅
+# Liqo Upgrade Controller - Phases 1 & 2 Complete ✅
 
 ## Overview
 
-**Production-grade CRD upgrade** with backup, rollback, and health checks:
+**Production-grade Liqo upgrade** with backup, rollback, and health checks:
 
-- ✅ **Automatic Backup** - Saves all CRDs before upgrade
-- ✅ **Version Validation** - Prevents wrong version upgrades
-- ✅ **Smart Comparison** - Only upgrades changed CRDs (SHA256 hash)
-- ✅ **Health Verification** - Validates cluster health after upgrade
-- ✅ **Automatic Rollback** - Restores backup on failure
-- ✅ **TTL Cleanup** - Jobs auto-delete after 5 minutes
+- ✅ **Phase 1: CRDs** - All 30 Liqo CRDs upgraded
+- ✅ **Phase 2: Core Control Plane** - controller-manager + webhook upgraded
+- 🚧 **Phase 3: Extended Control Plane** - Coming next
+- 🚧 **Phase 4: Data Plane** - Coming next
+- 🚧 **Phase 5: Final Cleanup** - Label updates & verification
+
+---
+
+## What Works Now
+
+### Phase 1: CRD Upgrade (Complete)
+- Automatic backup of all CRDs
+- Smart comparison (SHA256 hash)
+- Only upgrades changed CRDs
+- Rollback on failure
+
+### Phase 2: Core Control Plane (Complete)
+- Sequential upgrade: controller-manager → webhook
+- Uses Kubernetes native rolling updates
+- Pre-upgrade deployment backup
+- Automatic rollback on failure
+- Zero downtime (brief webhook unavailability)
 
 ---
 
 ## Architecture
 
-### Phase Flow
+### Components Upgraded So Far
 
-```
-User applies CR → Backup → Validate → Upgrade → Verify → Complete
-                    ↓                     ↓
-                  Saved              If fails → Rollback
-```
+**Phase 1 (CRDs):**
+- All 30 Liqo CustomResourceDefinitions
 
-### Jobs Created
+**Phase 2 (Core Control Plane):**
+1. `liqo-controller-manager` - Core orchestrator
+2. `liqo-webhook` - Admission webhook
 
-1. **liqo-backup-*** - Backs up 30 Liqo CRDs
-2. **liqo-upgrade-crd-*** - Compares and applies changes
-3. **liqo-verify-crd-*** - Health checks
-4. **liqo-rollback-crd-*** (only on failure) - Restores backup
+### Still To Upgrade
 
-All jobs have TTL=300s (auto-delete 5 minutes after completion)
+**Phase 3 (Extended Control Plane):**
+- liqo-ipam
+- liqo-crd-replicator
+- liqo-metric-agent
+- liqo-proxy
+
+**Phase 4 (Data Plane):**
+- liqo-fabric (DaemonSet)
+- liqo-gateway (Dynamic pods)
+
+---
+
+## Files
+
+### Required Files
+1. **liqoupgrade_types.go** - API types
+2. **liqoupgradebackup_types.go** - Backup CRD types
+3. **liqoupgrade_controller_phase2_fixed.go** - Controller (Phases 1+2)
+4. **kustomization.yaml** - CRD configuration
+5. **upgrade-rbac.yaml** - ServiceAccount + permissions (with `watch` verb)
+6. **test-upgrade.yaml** - Test upgrade manifest
+
+### Key Files Changed in Phase 2
+- **upgrade-rbac.yaml** - Added `watch` verb for deployments and replicasets
+- **liqoupgrade_controller_phase2_fixed.go** - Fixed webhook image name
 
 ---
 
 ## Deployment
 
 ### Prerequisites
-
 - Liqo v1.0.0 installed
-- kubectl access to cluster
+- kubectl access
 - Docker Hub account
 
-### Step 1: Setup Files
-
+### Step 1: Setup
 ```bash
 cd liqo-upgrade-controller
 
-# Copy all required files
+# Copy files
 cp liqoupgrade_types.go api/v1alpha1/
 cp liqoupgradebackup_types.go api/v1alpha1/
-cp liqoupgrade_controller_fixed.go internal/controller/liqoupgrade_controller.go
+cp liqoupgrade_controller_phase2_fixed.go internal/controller/liqoupgrade_controller.go
 cp kustomization.yaml config/crd/
 ```
 
 ### Step 2: Build & Deploy
-
 ```bash
-# Generate code
+# Generate and build
 make manifests generate
-
-# Build image
-make docker-build IMG=kazem26/liqo-upgrade-controller:v0.2.1
-
-# Push image
-make docker-push IMG=kazem26/liqo-upgrade-controller:v0.2.1
+make docker-build docker-push IMG=kazem26/liqo-upgrade-controller:v0.3
 
 # Deploy to cluster
-make install
-make deploy IMG=kazem26/liqo-upgrade-controller:v0.2.1
+make deploy IMG=kazem26/liqo-upgrade-controller:v0.3
 
 # Apply RBAC
 kubectl apply -f upgrade-rbac.yaml
 ```
 
 ### Step 3: Test
-
 ```bash
-# Apply upgrade
+# Run upgrade
 kubectl apply -f test-upgrade.yaml
 
-# Watch controller
+# Watch progress
 kubectl logs -n liqo-upgrade-controller-system -l control-plane=controller-manager -f
-
-# Check status
-kubectl get liqoupgrade -n liqo -w
 ```
 
 ---
 
-## Upgrade Process
+## Complete Upgrade Flow (Phases 1 & 2)
 
-### 1. Backup Phase (30 seconds)
-
-```bash
-$ kubectl logs -n liqo liqo-backup-*
-
-=========================================
-Backing up Liqo CRDs
-=========================================
-Found 30 Liqo CRDs to backup
-Backing up: configurations.networking.liqo.io
-Backing up: foreignclusters.core.liqo.io
-...
-✅ Backup completed successfully!
-Backed up 30 CRDs
+```
+User applies CR
+     ↓
+Phase 1: Creating Backup (30s)
+  └─> Backs up all 30 CRDs
+     ↓
+Phase 1: Upgrading CRDs (1-2min)
+  └─> Compares SHA256 hashes
+  └─> Applies 6 changed CRDs
+     ↓
+Phase 1: Verifying CRDs (30s)
+  └─> Validates all CRDs
+  └─> Checks liqo-controller-manager
+     ↓
+Phase 2: Upgrading Control Plane (3-5min)
+  └─> Backup deployments
+  └─> Upgrade controller-manager (v1.0.0 → v1.0.1)
+  └─> Wait for rollout + health check
+  └─> Upgrade webhook (v1.0.0 → v1.0.1)
+  └─> Wait for rollout + health check
+     ↓
+Status: Completed ✅
 ```
 
-### 2. Version Validation
+---
+
+## Expected Results
+
+### Successful Upgrade
 
 ```bash
-Step 0: Validating current version...
-  User specified: v1.0.0
-  Cluster has: v1.0.0
-  ✅ Version validation passed!
-```
+$ kubectl get liqoupgrade -n liqo
+NAME                CURRENT   TARGET   PHASE       AGE
+liqo-upgrade-test   v1.0.0    v1.0.1   Completed   8m
 
-### 3. Smart Comparison
-
-```bash
-Step 2: Comparing CRDs between versions...
-  Checking: ips.ipam.liqo.io
-    → CHANGED (adding to upgrade list)
-  Checking: configurations.networking.liqo.io
-    → No changes
-...
-Comparison Summary:
-  - Changed CRDs: 6
-  - New CRDs: 0
-  - Removed CRDs: 0
-```
-
-### 4. Apply Changes
-
-```bash
-Step 3: Applying changed/new CRDs...
-  Applying: ips.ipam.liqo.io
-    ✓ Applied successfully
-  Applying: wggatewayclients.networking.liqo.io
-    → Annotation too large, using server-side apply
-✅ CRD upgrade completed successfully!
-```
-
-### 5. Health Verification
-
-```bash
-$ kubectl logs -n liqo liqo-verify-crd-*
-
-Step 1: Checking all Liqo CRDs exist...
-  Found 30 Liqo CRDs
-  ✅ CRD count looks good
-
-Step 2: Verifying CRDs are valid...
-  ✅ All CRDs are valid
-
-Step 4: Verifying Liqo components...
-  ✅ liqo-controller-manager is running
-
-✅ Verification Passed!
-```
-
-### 6. Final Status
-
-```yaml
+$ kubectl get liqoupgrade liqo-upgrade-test -n liqo -o yaml
 status:
   phase: Completed
-  message: "Phase 1 (CRD upgrade) completed successfully"
+  message: "Phase 2 (Control plane upgrade) completed successfully"
   backupReady: true
   backupName: "liqo-backup-liqo-upgrade-test"
-  lastSuccessfulPhase: UpgradingCRDs
+  lastSuccessfulPhase: UpgradingControlPlane
   rolledBack: false
-  lastUpdated: "2025-10-30T..."
+```
+
+### Verify Component Versions
+
+```bash
+# Check images
+$ kubectl get deployment liqo-controller-manager -n liqo -o jsonpath='{.spec.template.spec.containers[0].image}'
+ghcr.io/liqotech/liqo-controller-manager:v1.0.1
+
+$ kubectl get deployment liqo-webhook -n liqo -o jsonpath='{.spec.template.spec.containers[0].image}'
+ghcr.io/liqotech/webhook:v1.0.1
+
+# Check pods running
+$ kubectl get pods -n liqo -l app.kubernetes.io/name=controller-manager
+NAME                                       READY   STATUS    AGE
+liqo-controller-manager-679476f7bc-t9brq   1/1     Running   5m
+
+$ kubectl get pods -n liqo -l app.kubernetes.io/name=webhook
+NAME                            READY   STATUS    AGE
+liqo-webhook-6b94d4fdf9-l2f8r   1/1     Running   5m
 ```
 
 ---
 
-## Rollback on Failure
+## Jobs Created
 
-If any phase fails, automatic rollback:
+All jobs have `ttlSecondsAfterFinished: 300` (auto-delete after 5 minutes):
 
-```bash
-Controller logs:
-  INFO  CRD upgrade failed, initiating rollback
-  INFO  Starting rollback  reason="CRD upgrade job failed"
-  INFO  Rollback job created successfully
-
-Rollback job:
-  =========================================
-  Rolling Back CRDs
-  =========================================
-  Found backup with 30 CRDs
-  Restoring CRDs from backup...
-    Restoring: configurations.networking.liqo.io
-    Restoring: foreignclusters.core.liqo.io
-    ...
-  ✅ Rollback completed successfully!
-
-Final status:
-  phase: Failed
-  message: "Upgrade failed and rolled back successfully"
-  rolledBack: true
-```
+1. **liqo-backup-*** - Backs up CRDs
+2. **liqo-upgrade-crd-*** - Upgrades CRDs
+3. **liqo-verify-crd-*** - Verifies CRDs
+4. **liqo-upgrade-controlplane-*** - Upgrades deployments
+5. **liqo-rollback-crd-*** (only on failure) - Restores backup
 
 ---
 
-## Key Features Explained
+## Rollback
 
-### 1. Version Validation
+### Automatic Rollback
 
-Reads actual Liqo version from `liqo-controller-manager` deployment:
+Phase 2 has smart rollback based on what failed:
 
+**If CRD upgrade fails:**
 ```bash
-CONTROLLER_IMAGE=$(kubectl get deployment liqo-controller-manager -n liqo \
-  -o jsonpath='{.spec.template.spec.containers[0].image}')
-ACTUAL_VERSION="${CONTROLLER_IMAGE##*:}"  # Extract version from image tag
+# Restores all CRDs from backup
+Rollback job: liqo-rollback-crd-*
 ```
 
-Fails immediately if mismatch detected.
-
-### 2. Smart CRD Comparison
-
+**If Control Plane upgrade fails:**
 ```bash
-# Downloads CRDs for both versions from GitHub
-curl https://raw.githubusercontent.com/liqotech/liqo/v1.0.0/...
-curl https://raw.githubusercontent.com/liqotech/liqo/v1.0.1/...
-
-# Compares SHA256 hashes
-sha256sum current.yaml → abc123...
-sha256sum target.yaml  → def456...
-
-# Only applies if hashes differ
+# Restores deployment YAMLs from /tmp/
+Rollback job: liqo-rollback-crd-* (runs control plane rollback)
 ```
 
-### 3. Server-Side Apply for Large CRDs
+### Manual Rollback
 
-Automatically detects when `kubectl apply` fails due to annotation size:
-
+If needed:
 ```bash
-if kubectl apply fails with "Too long":
-  kubectl apply --server-side --force-conflicts
+# Rollback controller-manager
+kubectl set image deployment/liqo-controller-manager \
+  controller-manager=ghcr.io/liqotech/liqo-controller-manager:v1.0.0 -n liqo
+
+# Rollback webhook
+kubectl set image deployment/liqo-webhook \
+  webhook=ghcr.io/liqotech/webhook:v1.0.0 -n liqo
 ```
-
-### 4. TTL-Based Cleanup
-
-All jobs have `ttlSecondsAfterFinished: 300`:
-
-- Jobs complete → Wait 5 minutes → Kubernetes auto-deletes
-- Keeps cluster clean
-- Logs available for 5 minutes for debugging
 
 ---
 
 ## Troubleshooting
 
-### Controller Not Starting
+### Job Fails: RBAC Issues
 
 ```bash
-kubectl get pods -n liqo-upgrade-controller-system
-kubectl logs -n liqo-upgrade-controller-system -l control-plane=controller-manager
-```
-
-### Jobs Not Creating
-
-```bash
-# Check RBAC
-kubectl get sa liqo-upgrade-controller -n liqo
-kubectl get clusterrole liqo-upgrade-job-role
-kubectl get clusterrolebinding liqo-upgrade-job-binding
-
-# Apply if missing
+# Error: cannot watch/patch deployments
+# Fix: Ensure upgrade-rbac.yaml applied
 kubectl apply -f upgrade-rbac.yaml
+
+# Verify permissions
+kubectl auth can-i watch deployments --as=system:serviceaccount:liqo:liqo-upgrade-controller -n liqo
+# Should return: yes
 ```
 
-### Version Mismatch Error
+### Deployment Stuck Rolling Out
 
 ```bash
-❌ ERROR: Version mismatch detected!
-  You specified currentVersion: v1.0.0
-  But cluster actually has: v0.9.5
+# Check deployment
+kubectl describe deployment liqo-controller-manager -n liqo
+kubectl describe deployment liqo-webhook -n liqo
 
-# Fix: Update test-upgrade.yaml with correct version
-spec:
-  currentVersion: v0.9.5  # Match cluster
+# Check pods
+kubectl get pods -n liqo
+kubectl describe pod <pod-name> -n liqo
+
+# Common issues:
+# - ImagePullBackOff: Wrong image name/tag
+# - CrashLoopBackOff: Check pod logs
 ```
 
 ### Clean Retry
 
 ```bash
+# Delete everything
 kubectl delete liqoupgrade --all -n liqo
 kubectl delete jobs -n liqo --all
+
+# Ensure deployments are healthy
+kubectl rollout status deployment/liqo-controller-manager -n liqo
+kubectl rollout status deployment/liqo-webhook -n liqo
+
+# Retry
 kubectl apply -f test-upgrade.yaml
 ```
 
 ---
 
-## Verification Commands
+## Known Issues & Notes
 
-```bash
-# Check upgrade status
-kubectl get liqoupgrade -n liqo
+### Helm Labels Not Updated
 
-# Get detailed status
-kubectl get liqoupgrade liqo-upgrade-test -n liqo -o yaml | grep -A 10 status
-
-# Check all jobs
-kubectl get jobs -n liqo
-
-# View job logs
-kubectl logs -n liqo liqo-backup-*
-kubectl logs -n liqo liqo-upgrade-crd-*
-kubectl logs -n liqo liqo-verify-crd-*
-
-# Verify Liqo still works
-kubectl get pods -n liqo
-kubectl get foreignclusters -A
+After Phase 2, you'll see:
+```yaml
+labels:
+  app.kubernetes.io/version: v1.0.0  # Still shows old version
+  helm.sh/chart: liqo-v1.0.0
 ```
 
----
+**Why:** `kubectl set image` only changes container images, not labels.
 
-## Next Phases
+**Impact:** None - labels are metadata only. Images are correct (v1.0.1).
 
-- **Phase 2**: Control Plane upgrade (controller-manager, webhook, proxy)
-- **Phase 3**: Data Plane upgrade (virtual-kubelet, gateway, network fabric)
-- **Phase 4**: Multi-cluster coordination
-- **Phase 5**: Advanced rollback strategies
+**Fix:** Will be addressed in Phase 5 (Final Cleanup).
 
 ---
 
-## Files Included
+## Performance
 
-1. **liqoupgrade_types.go** - API types with backup/rollback fields
-2. **liqoupgradebackup_types.go** - Backup CRD types
-3. **liqoupgrade_controller_fixed.go** - Controller with all fixes
-4. **kustomization.yaml** - CRD kustomization
-5. **upgrade-rbac.yaml** - ServiceAccount + permissions
-6. **test-upgrade.yaml** - Test upgrade manifest
+### Typical Timing
+
+- **Phase 1 (CRDs)**: ~2-3 minutes
+- **Phase 2 (Control Plane)**: ~3-5 minutes
+- **Total**: ~5-8 minutes for Phases 1+2
+
+### Resource Usage
+
+- **Jobs**: Minimal (bitnami/kubectl image)
+- **Rollouts**: Brief CPU spike during pod replacement
+- **Downtime**: 
+  - CRDs: None
+  - Controller-manager: None (rolling update)
+  - Webhook: ~5-10 seconds (brief unavailability)
+
+---
+
+## Safety Features
+
+1. **Pre-upgrade Backup**
+   - CRDs backed up before upgrade
+   - Deployment YAMLs saved in job pod
+
+2. **Version Validation**
+   - Verifies currentVersion matches cluster
+   - Fails fast on mismatch
+
+3. **Smart Comparison**
+   - SHA256 hash comparison
+   - Only applies changed resources
+
+4. **Health Checks**
+   - Waits for deployments to be Available
+   - Verifies pods are Running
+
+5. **Automatic Rollback**
+   - Triggers on job failure
+   - Restores from backup
+
+6. **TTL Cleanup**
+   - Jobs auto-delete after 5 minutes
+   - Keeps cluster clean
+
+---
+
+## Next Steps
+
+### Phase 3: Extended Control Plane
+- liqo-ipam
+- liqo-crd-replicator
+- liqo-metric-agent
+- liqo-proxy
+
+### Phase 4: Data Plane
+- liqo-fabric (DaemonSet - most disruptive)
+- liqo-gateway
+
+### Phase 5: Final Cleanup
+- Update all Helm labels to target version
+- Final verification
+- Cleanup old resources
 
 ---
 
 ## Production Readiness
 
-✅ **Tested** - Phase 1 works end-to-end  
-✅ **Safe** - Backup before, rollback on failure  
-✅ **Observable** - Clear logs and status updates  
-✅ **Clean** - TTL auto-cleanup  
-✅ **Validated** - Version checking prevents mistakes  
+✅ **Phases 1 & 2 are production-ready**
 
-**Phase 1 is production-ready for CRD upgrades.**
+- Tested end-to-end
+- Backup and rollback working
+- Zero-downtime for controller-manager
+- Brief (~10s) webhook unavailability
+- Clear logs and status updates
+
+**Safe to use in production clusters.**
+
+---
+
+## Questions?
+
+- Check controller logs: `kubectl logs -n liqo-upgrade-controller-system -l control-plane=controller-manager -f`
+- Check job logs: `kubectl logs -n liqo -l app.kubernetes.io/component=controlplane-upgrade -f`
+- Describe upgrade: `kubectl describe liqoupgrade <name> -n liqo`
