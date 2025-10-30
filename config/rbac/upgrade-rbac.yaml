@@ -9,18 +9,22 @@ kind: ClusterRole
 metadata:
   name: liqo-upgrade-job-role
 rules:
-# CRD permissions - needed to apply CRDs
+# CRD permissions
 - apiGroups: ["apiextensions.k8s.io"]
   resources: ["customresourcedefinitions"]
   verbs: ["get", "list", "watch", "create", "update", "patch"]
-# Pod permissions - for logging
+# Deployment permissions - MUST include watch for rollout status
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+# Pod permissions
 - apiGroups: [""]
   resources: ["pods", "pods/log"]
   verbs: ["get", "list"]
-# Deployment permissions - needed to detect Liqo version
+# ReplicaSet permissions (needed for rollout status)
 - apiGroups: ["apps"]
-  resources: ["deployments"]
-  verbs: ["get", "list"]
+  resources: ["replicasets"]
+  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
