@@ -20,6 +20,17 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// RemoteClusterVersion represents a remote cluster's Liqo version
+type RemoteClusterVersion struct {
+	// ClusterID is the unique identifier of the remote cluster
+	// +kubebuilder:validation:Required
+	ClusterID string `json:"clusterID"`
+
+	// Version is the Liqo version running on the remote cluster
+	// +kubebuilder:validation:Required
+	Version string `json:"version"`
+}
+
 // LiqoUpgradeSpec defines the desired state of LiqoUpgrade
 type LiqoUpgradeSpec struct {
 	// CurrentVersion is the current Liqo version (e.g., "v1.0.0")
@@ -34,6 +45,11 @@ type LiqoUpgradeSpec struct {
 	// +kubebuilder:default="liqo"
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
+
+	// RemoteClusterVersions lists the Liqo versions of remote peered clusters (optional)
+	// If not provided, the controller assumes remote clusters are running the same version as local cluster
+	// +optional
+	RemoteClusterVersions []RemoteClusterVersion `json:"remoteClusterVersions,omitempty"`
 }
 
 // UpgradePhase represents the current phase of the upgrade process
@@ -43,23 +59,17 @@ const (
 	// PhaseNone means upgrade hasn't started
 	PhaseNone UpgradePhase = ""
 
+	// PhaseCompatibilityCheck means we're checking version compatibility
+	PhaseCompatibilityCheck UpgradePhase = "CheckingCompatibility"
+
 	// PhaseBackup means we're creating backup
 	PhaseBackup UpgradePhase = "CreatingBackup"
 
-	// PhaseCRDs means we're upgrading CRDs
+	// PhaseCRDs means we're upgrading and verifying CRDs
 	PhaseCRDs UpgradePhase = "UpgradingCRDs"
 
-	// PhaseVerifyingCRDs means we're verifying CRDs after upgrade
-	PhaseVerifyingCRDs UpgradePhase = "VerifyingCRDs"
-
-	// PhaseControlPlane means we're upgrading control plane components
+	// PhaseControlPlane means we're upgrading and verifying control plane components
 	PhaseControlPlane UpgradePhase = "UpgradingControlPlane"
-
-	// PhaseDataPlane means we're upgrading data plane components
-	PhaseDataPlane UpgradePhase = "UpgradingDataPlane"
-
-	// PhaseVerification means we're verifying the upgrade
-	PhaseVerification UpgradePhase = "Verifying"
 
 	// PhaseRollingBack means we're rolling back
 	PhaseRollingBack UpgradePhase = "RollingBack"
@@ -85,7 +95,7 @@ type LiqoUpgradeStatus struct {
 	// +optional
 	LastUpdated metav1.Time `json:"lastUpdated,omitempty"`
 
-	// BackupName references the backup created before upgrade
+	// BackupName references the backup job created before upgrade
 	// +optional
 	BackupName string `json:"backupName,omitempty"`
 
@@ -101,9 +111,17 @@ type LiqoUpgradeStatus struct {
 	// +optional
 	RolledBack bool `json:"rolledBack,omitempty"`
 
-	// PeeringHealthy indicates if peering is healthy (for multi-cluster)
+	// DetectedLocalVersion is the actual version detected on the local cluster
 	// +optional
-	PeeringHealthy *bool `json:"peeringHealthy,omitempty"`
+	DetectedLocalVersion string `json:"detectedLocalVersion,omitempty"`
+
+	// LowestVersion is the lowest version among local and remote clusters
+	// +optional
+	LowestVersion string `json:"lowestVersion,omitempty"`
+
+	// CompatibilityCheckPassed indicates if compatibility check succeeded
+	// +optional
+	CompatibilityCheckPassed *bool `json:"compatibilityCheckPassed,omitempty"`
 
 	// conditions represent the current state of the LiqoUpgrade resource
 	// +listType=map

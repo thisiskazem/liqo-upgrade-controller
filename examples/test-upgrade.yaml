@@ -7,3 +7,11 @@ spec:
   currentVersion: v1.0.0
   targetVersion: v1.0.1
   namespace: liqo
+  
+  # Optional: Specify remote cluster versions for multi-cluster upgrades
+  # If not specified, controller assumes remote clusters are running same version as local
+  # remoteClusterVersions:
+  #   - clusterID: "cluster-2"
+  #     version: "v1.0.0"
+  #   - clusterID: "cluster-3"
+  #     version: "v0.9.0"  # This would make v0.9.0 the lowest version to check

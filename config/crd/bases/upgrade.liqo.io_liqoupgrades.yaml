@@ -59,6 +59,27 @@ spec:
                 default: liqo
                 description: 'Namespace where Liqo is installed (default: "liqo")'
                 type: string
+              remoteClusterVersions:
+                description: |-
+                  RemoteClusterVersions lists the Liqo versions of remote peered clusters (optional)
+                  If not provided, the controller assumes remote clusters are running the same version as local cluster
+                items:
+                  description: RemoteClusterVersion represents a remote cluster's
+                    Liqo version
+                  properties:
+                    clusterID:
+                      description: ClusterID is the unique identifier of the remote
+                        cluster
+                      type: string
+                    version:
+                      description: Version is the Liqo version running on the remote
+                        cluster
+                      type: string
+                  required:
+                  - clusterID
+                  - version
+                  type: object
+                type: array
               targetVersion:
                 description: TargetVersion is the desired Liqo version (e.g., "v1.0.1")
                 type: string
@@ -70,10 +91,14 @@ spec:
             description: LiqoUpgradeStatus defines the observed state of LiqoUpgrade
             properties:
               backupName:
-                description: BackupName references the backup created before upgrade
+                description: BackupName references the backup job created before upgrade
                 type: string
               backupReady:
                 description: BackupReady indicates if backup is available for rollback
+                type: boolean
+              compatibilityCheckPassed:
+                description: CompatibilityCheckPassed indicates if compatibility check
+                  succeeded
                 type: boolean
               conditions:
                 description: conditions represent the current state of the LiqoUpgrade
@@ -136,6 +161,10 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              detectedLocalVersion:
+                description: DetectedLocalVersion is the actual version detected on
+                  the local cluster
+                type: string
               lastSuccessfulPhase:
                 description: LastSuccessfulPhase is the last phase that completed
                   successfully
@@ -144,13 +173,14 @@ spec:
                 description: LastUpdated is the timestamp of the last status update
                 format: date-time
                 type: string
+              lowestVersion:
+                description: LowestVersion is the lowest version among local and remote
+                  clusters
+                type: string
               message:
                 description: Message provides human-readable details about the current
                   phase
                 type: string
-              peeringHealthy:
-                description: PeeringHealthy indicates if peering is healthy (for multi-cluster)
-                type: boolean
               phase:
                 description: Phase indicates the current phase of the upgrade
                 type: string

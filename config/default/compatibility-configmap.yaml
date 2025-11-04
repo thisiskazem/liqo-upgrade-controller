@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: liqo-version-compatibility
+  namespace: liqo
+  labels:
+    app.kubernetes.io/name: liqo
+    app.kubernetes.io/component: upgrade-compatibility
+data:
+  compatibility.yaml: |
+    # Liqo Version Compatibility Matrix
+    # Format: sourceVersion: [list of compatible targetVersions]
+    #
+    # This matrix defines which Liqo versions can be upgraded to which target versions.
+    # The controller will check this matrix before starting any upgrade process.
+    #
+    # Example:
+    # v1.0.0:
+    #   - v1.0.1  # Can upgrade from v1.0.0 to v1.0.1
+    #   - v1.0.2  # Can upgrade from v1.0.0 to v1.0.2
+    #
+    # IMPORTANT: This matrix applies to the LOWEST version among local and remote clusters.
+    # If you have multiple clusters peered, the upgrade path must be compatible with the
+    # oldest version in your cluster mesh.
+
+    v1.0.0:
+      - v1.0.1
+      - v1.0.2
+    
+    v1.0.1:
+      - v1.0.2
+      - v1.1.0
+    
+    v1.0.2:
+      - v1.1.0
+      - v1.1.1
+    
+    v1.1.0:
+      - v1.1.1
+      - v1.2.0
+    
+    v1.1.1:
+      - v1.2.0

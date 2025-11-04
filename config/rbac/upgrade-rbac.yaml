@@ -25,6 +25,13 @@ rules:
 - apiGroups: ["apps"]
   resources: ["replicasets"]
   verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -38,3 +45,7 @@ subjects:
 - kind: ServiceAccount
   name: liqo-upgrade-controller
   namespace: liqo
+# Also bind the controller manager ServiceAccount so it can watch cluster-scoped Deployments
+- kind: ServiceAccount
+  name: liqo-upgrade-controller-controller-manager
+  namespace: liqo-upgrade-controller-system
