@@ -71,6 +71,9 @@ const (
 	// PhaseControlPlane means we're upgrading and verifying control plane components
 	PhaseControlPlane UpgradePhase = "UpgradingControlPlane"
 
+	// PhaseExtendedControlPlane means we're upgrading extended control plane components
+	PhaseExtendedControlPlane UpgradePhase = "UpgradingExtendedControlPlane"
+
 	// PhaseRollingBack means we're rolling back
 	PhaseRollingBack UpgradePhase = "RollingBack"
 
