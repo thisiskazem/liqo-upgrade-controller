@@ -51,6 +51,7 @@ const (
 	rollbackJobPrefix             = "liqo-rollback"
 	controlPlaneJobPrefix         = "liqo-upgrade-controlplane"
 	extendedControlPlaneJobPrefix = "liqo-upgrade-extended-controlplane"
+	dataPlaneJobPrefix            = "liqo-upgrade-dataplane"
 	compatibilityConfigMap        = "liqo-version-compatibility"
 )
 
@@ -108,6 +109,8 @@ func (r *LiqoUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.monitorControlPlaneUpgrade(ctx, upgrade)
 	case upgradev1alpha1.PhaseExtendedControlPlane:
 		return r.monitorExtendedControlPlaneUpgrade(ctx, upgrade)
+	case upgradev1alpha1.PhaseDataPlane:
+		return r.monitorDataPlaneUpgrade(ctx, upgrade)
 	case upgradev1alpha1.PhaseRollingBack:
 		return r.monitorRollback(ctx, upgrade)
 	case upgradev1alpha1.PhaseCompleted:
@@ -518,10 +521,10 @@ func (r *LiqoUpgradeReconciler) monitorExtendedControlPlaneUpgrade(ctx context.C
 		statusUpdates := map[string]interface{}{
 			"lastSuccessfulPhase": upgradev1alpha1.PhaseExtendedControlPlane,
 		}
-		if _, err := r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseExtendedControlPlane, "Extended control plane upgrade and verification completed", statusUpdates); err != nil {
+		if _, err := r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseExtendedControlPlane, "Extended control plane upgrade completed, starting data plane upgrade", statusUpdates); err != nil {
 			return ctrl.Result{}, err
 		}
-		return r.completeUpgrade(ctx, upgrade)
+		return r.startDataPlaneUpgrade(ctx, upgrade)
 	}
 
 	if job.Status.Failed > 0 {
@@ -530,6 +533,57 @@ func (r *LiqoUpgradeReconciler) monitorExtendedControlPlaneUpgrade(ctx context.C
 	}
 
 	logger.Info("Extended control plane upgrade job still running")
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// startDataPlaneUpgrade starts Phase 5: Data Plane upgrade
+func (r *LiqoUpgradeReconciler) startDataPlaneUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	logger.Info("Phase 5: Starting data plane upgrade")
+
+	job := r.buildDataPlaneUpgradeJob(upgrade)
+	if err := controllerutil.SetControllerReference(upgrade, job, r.Scheme); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.Create(ctx, job); err != nil {
+		if !errors.IsAlreadyExists(err) {
+			logger.Error(err, "Failed to create data plane upgrade job")
+			return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, "Failed to create data plane upgrade job", nil)
+		}
+	}
+
+	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseDataPlane, "Data plane upgrade job created", nil)
+}
+
+// monitorDataPlaneUpgrade monitors the data plane upgrade job (Phase 5)
+func (r *LiqoUpgradeReconciler) monitorDataPlaneUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	jobName := fmt.Sprintf("%s-%s", dataPlaneJobPrefix, upgrade.Name)
+	job := &batchv1.Job{}
+	if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: upgrade.Spec.Namespace}, job); err != nil {
+		logger.Error(err, "Failed to get data plane upgrade job")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	if job.Status.Succeeded > 0 {
+		logger.Info("Phase 5 completed: Data plane upgrade successful!")
+		statusUpdates := map[string]interface{}{
+			"lastSuccessfulPhase": upgradev1alpha1.PhaseDataPlane,
+		}
+		if _, err := r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseDataPlane, "Data plane upgrade completed", statusUpdates); err != nil {
+			return ctrl.Result{}, err
+		}
+		return r.completeUpgrade(ctx, upgrade)
+	}
+
+	if job.Status.Failed > 0 {
+		logger.Error(nil, "Phase 5 failed: Data plane upgrade failed, rolling back EVERYTHING")
+		return r.startRollback(ctx, upgrade, "Phase 5 (Data plane upgrade) failed - rolling back everything")
+	}
+
+	logger.Info("Data plane upgrade job still running")
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
@@ -1132,6 +1186,162 @@ echo "========================================="
 	}
 }
 
+// buildDataPlaneUpgradeJob creates the data plane upgrade job
+func (r *LiqoUpgradeReconciler) buildDataPlaneUpgradeJob(upgrade *upgradev1alpha1.LiqoUpgrade) *batchv1.Job {
+	jobName := fmt.Sprintf("%s-%s", dataPlaneJobPrefix, upgrade.Name)
+	namespace := upgrade.Spec.Namespace
+	if namespace == "" {
+		namespace = "liqo"
+	}
+
+	script := fmt.Sprintf(`#!/bin/bash
+set -e
+
+echo "========================================="
+echo "Phase 5: Data Plane Upgrade"
+echo "========================================="
+
+CURRENT_VERSION="%s"
+TARGET_VERSION="%s"
+NAMESPACE="%s"
+
+echo "Upgrading from $CURRENT_VERSION to $TARGET_VERSION"
+echo "Namespace: $NAMESPACE"
+echo ""
+
+# Step 1: Upgrade liqo-gateway (Deployment)
+echo "Step 1: Upgrading liqo-gateway..."
+if kubectl get deployment liqo-gateway -n "$NAMESPACE" >/dev/null 2>&1; then
+    echo "  Current image:"
+    kubectl get deployment liqo-gateway -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].image}'
+    echo ""
+    
+    NEW_GATEWAY_IMAGE="ghcr.io/liqotech/gateway:${TARGET_VERSION}"
+    echo "  New image: $NEW_GATEWAY_IMAGE"
+    
+    CONTAINER_NAME=$(kubectl get deployment liqo-gateway -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].name}')
+    kubectl set image deployment/liqo-gateway \
+      "$CONTAINER_NAME=$NEW_GATEWAY_IMAGE" \
+      -n "$NAMESPACE"
+    
+    echo "  Waiting for rollout..."
+    if ! kubectl rollout status deployment/liqo-gateway -n "$NAMESPACE" --timeout=5m; then
+        echo "  ❌ liqo-gateway rollout failed!"
+        exit 1
+    fi
+    
+    echo "  Verifying liqo-gateway is healthy..."
+    if ! kubectl wait --for=condition=available --timeout=2m deployment/liqo-gateway -n "$NAMESPACE"; then
+        echo "  ❌ liqo-gateway not healthy!"
+        exit 1
+    fi
+    
+    echo "  ✅ liqo-gateway upgraded and verified"
+else
+    echo "  ⚠️  WARNING: liqo-gateway deployment not found, skipping..."
+fi
+echo ""
+
+# Step 2: Upgrade liqo-fabric (DaemonSet)
+echo "Step 2: Upgrading liqo-fabric DaemonSet..."
+if kubectl get daemonset liqo-fabric -n "$NAMESPACE" >/dev/null 2>&1; then
+    echo "  Current image:"
+    kubectl get daemonset liqo-fabric -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].image}'
+    echo ""
+    
+    NEW_FABRIC_IMAGE="ghcr.io/liqotech/fabric:${TARGET_VERSION}"
+    echo "  New image: $NEW_FABRIC_IMAGE"
+    
+    CONTAINER_NAME=$(kubectl get daemonset liqo-fabric -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].name}')
+    kubectl set image daemonset/liqo-fabric \
+      "$CONTAINER_NAME=$NEW_FABRIC_IMAGE" \
+      -n "$NAMESPACE"
+    
+    echo "  Waiting for DaemonSet rollout..."
+    if ! kubectl rollout status daemonset/liqo-fabric -n "$NAMESPACE" --timeout=10m; then
+        echo "  ❌ liqo-fabric rollout failed!"
+        exit 1
+    fi
+    
+    echo "  Verifying liqo-fabric pods..."
+    DESIRED=$(kubectl get daemonset liqo-fabric -n "$NAMESPACE" -o jsonpath='{.status.desiredNumberScheduled}')
+    READY=$(kubectl get daemonset liqo-fabric -n "$NAMESPACE" -o jsonpath='{.status.numberReady}')
+    
+    if [ "$DESIRED" != "$READY" ]; then
+        echo "  ❌ ERROR: liqo-fabric not all pods ready! Desired: $DESIRED, Ready: $READY"
+        exit 1
+    fi
+    
+    echo "  ✅ liqo-fabric upgraded and verified ($READY/$DESIRED pods ready)"
+else
+    echo "  ⚠️  WARNING: liqo-fabric daemonset not found, skipping..."
+fi
+echo ""
+
+# Step 3: Final verification
+echo "========================================="
+echo "Final Verification - Data Plane"
+echo "========================================="
+
+if kubectl get deployment liqo-gateway -n "$NAMESPACE" >/dev/null 2>&1; then
+    echo "  Checking liqo-gateway:"
+    GATEWAY_IMAGE=$(kubectl get deployment liqo-gateway -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].image}')
+    echo "    Image: $GATEWAY_IMAGE"
+    
+    if [[ "$GATEWAY_IMAGE" != *"$TARGET_VERSION"* ]]; then
+        echo "    ❌ ERROR: liqo-gateway not running target version!"
+        exit 1
+    fi
+fi
+
+if kubectl get daemonset liqo-fabric -n "$NAMESPACE" >/dev/null 2>&1; then
+    echo "  Checking liqo-fabric:"
+    FABRIC_IMAGE=$(kubectl get daemonset liqo-fabric -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].image}')
+    echo "    Image: $FABRIC_IMAGE"
+    
+    if [[ "$FABRIC_IMAGE" != *"$TARGET_VERSION"* ]]; then
+        echo "    ❌ ERROR: liqo-fabric not running target version!"
+        exit 1
+    fi
+    
+    kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/name=fabric
+fi
+
+echo ""
+echo "========================================="
+echo "✅ Phase 5 Complete: Data Plane Upgrade Passed!"
+echo "========================================="
+`, upgrade.Spec.CurrentVersion, upgrade.Spec.TargetVersion, namespace)
+
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/name":      "liqo-upgrade",
+				"app.kubernetes.io/component": "dataplane-upgrade",
+			},
+		},
+		Spec: batchv1.JobSpec{
+			TTLSecondsAfterFinished: int32Ptr(300),
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					ServiceAccountName: "liqo-upgrade-controller",
+					RestartPolicy:      corev1.RestartPolicyNever,
+					Containers: []corev1.Container{
+						{
+							Name:    "upgrade-dataplane",
+							Image:   "bitnami/kubectl:latest",
+							Command: []string{"/bin/bash", "-c", script},
+						},
+					},
+				},
+			},
+			BackoffLimit: int32Ptr(0),
+		},
+	}
+}
+
 // buildRollbackJob creates the rollback job
 func (r *LiqoUpgradeReconciler) buildRollbackJob(upgrade *upgradev1alpha1.LiqoUpgrade) *batchv1.Job {
 	jobName := fmt.Sprintf("%s-%s", rollbackJobPrefix, upgrade.Name)
@@ -1143,7 +1353,8 @@ func (r *LiqoUpgradeReconciler) buildRollbackJob(upgrade *upgradev1alpha1.LiqoUp
 	var rollbackScript string
 
 	if upgrade.Status.LastSuccessfulPhase == upgradev1alpha1.PhaseControlPlane ||
-		upgrade.Status.LastSuccessfulPhase == upgradev1alpha1.PhaseExtendedControlPlane {
+		upgrade.Status.LastSuccessfulPhase == upgradev1alpha1.PhaseExtendedControlPlane ||
+		upgrade.Status.LastSuccessfulPhase == upgradev1alpha1.PhaseDataPlane {
 		// Phase 3 or Phase 4 failed - rollback EVERYTHING
 		rollbackScript = `#!/bin/bash
 set -e
@@ -1331,7 +1542,7 @@ func (r *LiqoUpgradeReconciler) handleDeletion(ctx context.Context, upgrade *upg
 	logger := log.FromContext(ctx)
 
 	if controllerutil.ContainsFinalizer(upgrade, finalizerName) {
-		jobPrefixes := []string{backupJobPrefix, upgradeJobPrefix, rollbackJobPrefix, controlPlaneJobPrefix, extendedControlPlaneJobPrefix}
+		jobPrefixes := []string{backupJobPrefix, upgradeJobPrefix, rollbackJobPrefix, controlPlaneJobPrefix, extendedControlPlaneJobPrefix, dataPlaneJobPrefix}
 		for _, prefix := range jobPrefixes {
 			jobName := fmt.Sprintf("%s-%s", prefix, upgrade.Name)
 			job := &batchv1.Job{}
