@@ -19,9 +19,24 @@ rules:
   resources: ["deployments"]
   verbs: ["get", "list", "watch", "patch", "update"]
 
+# Deployment scale permissions (for scaling down controller-manager during gateway upgrades)
+- apiGroups: ["apps"]
+  resources: ["deployments/scale"]
+  verbs: ["get", "patch", "update"]
+
 # Deployment status (for rollout status)
 - apiGroups: ["apps"]
   resources: ["deployments/status"]
+  verbs: ["get", "watch"]
+
+# DaemonSet permissions (for Stage 3 - liqo-fabric)
+- apiGroups: ["apps"]
+  resources: ["daemonsets"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+
+# DaemonSet status (for rollout status)
+- apiGroups: ["apps"]
+  resources: ["daemonsets/status"]
   verbs: ["get", "watch"]
 
 # ReplicaSet permissions (needed for rollout status)
@@ -34,10 +49,15 @@ rules:
   resources: ["pods", "pods/log"]
   verbs: ["get", "list", "watch"]
 
-# ConfigMap permissions (for compatibility matrix)
+# Namespace permissions (to discover liqo-tenant-* namespaces)
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list", "watch"]
+
+# ConfigMap permissions (for compatibility matrix and env backup)
 - apiGroups: [""]
   resources: ["configmaps"]
-  verbs: ["get", "list", "watch"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
 
 # Job permissions
 - apiGroups: ["batch"]
@@ -52,6 +72,11 @@ rules:
 - apiGroups: ["offloading.liqo.io"]
   resources: ["namespaceoffloadings"]
   verbs: ["get", "list", "watch"]
+
+# Liqo networking resources (for gateway upgrades)
+- apiGroups: ["networking.liqo.io"]
+  resources: ["gateways", "connections", "gatewayclients", "gatewayservers", "wggatewayclients", "wggatewayservers", "wggatewayclienttemplates", "wggatewayservertemplates"]
+  verbs: ["get", "list", "watch", "patch", "update", "delete"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

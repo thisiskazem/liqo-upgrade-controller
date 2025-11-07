@@ -51,6 +51,7 @@ const (
 	PhaseFreezingOperations UpgradePhase = "FreezingOperations"
 	PhaseCRDs               UpgradePhase = "UpgradingCRDs"
 	PhaseControllerManager  UpgradePhase = "UpgradingControllerManager"
+	PhaseNetworkFabric      UpgradePhase = "UpgradingNetworkFabric"
 	PhaseVerifying          UpgradePhase = "Verifying"
 	PhaseRollingBack        UpgradePhase = "RollingBack"
 	PhaseCompleted          UpgradePhase = "Completed"
