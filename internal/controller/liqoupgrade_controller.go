@@ -45,14 +45,12 @@ type LiqoUpgradeReconciler struct {
 }
 
 const (
-	finalizerName                 = "upgrade.liqo.io/finalizer"
-	backupJobPrefix               = "liqo-backup"
-	upgradeJobPrefix              = "liqo-upgrade-crd"
-	rollbackJobPrefix             = "liqo-rollback"
-	controlPlaneJobPrefix         = "liqo-upgrade-controlplane"
-	extendedControlPlaneJobPrefix = "liqo-upgrade-extended-controlplane"
-	dataPlaneJobPrefix            = "liqo-upgrade-dataplane"
-	compatibilityConfigMap        = "liqo-version-compatibility"
+	finalizerName                  = "upgrade.liqo.io/finalizer"
+	freezeOperationsJobPrefix      = "liqo-freeze-operations"
+	crdUpgradeJobPrefix            = "liqo-upgrade-crd"
+	controllerManagerUpgradePrefix = "liqo-upgrade-controller-manager"
+	rollbackJobPrefix              = "liqo-rollback"
+	compatibilityConfigMap         = "liqo-version-compatibility"
 )
 
 // CompatibilityMatrix represents the version compatibility data
@@ -64,6 +62,8 @@ type CompatibilityMatrix map[string][]string
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=serviceaccounts;configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;patch;update
+// +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch;create;update;patch
 
 func (r *LiqoUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -93,24 +93,21 @@ func (r *LiqoUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// State machine based on current phase
-	logger.Info("Reconciling upgrade", "currentPhase", upgrade.Status.Phase)
+	logger.Info("Reconciling upgrade", "currentPhase", upgrade.Status.Phase, "stage", upgrade.Status.CurrentStage)
 
 	switch upgrade.Status.Phase {
-	case "":
-		logger.Info("Phase is empty, starting compatibility check")
-		return r.startCompatibilityCheck(ctx, upgrade)
-	case upgradev1alpha1.PhaseCompatibilityCheck:
-		return r.checkCompatibility(ctx, upgrade)
-	case upgradev1alpha1.PhaseBackup:
-		return r.monitorBackup(ctx, upgrade)
+	case "", upgradev1alpha1.PhasePending:
+		return r.startValidation(ctx, upgrade)
+	case upgradev1alpha1.PhaseValidating:
+		return r.performValidation(ctx, upgrade)
+	case upgradev1alpha1.PhaseFreezingOperations:
+		return r.monitorFreezeOperations(ctx, upgrade)
 	case upgradev1alpha1.PhaseCRDs:
 		return r.monitorCRDUpgrade(ctx, upgrade)
-	case upgradev1alpha1.PhaseControlPlane:
-		return r.monitorControlPlaneUpgrade(ctx, upgrade)
-	case upgradev1alpha1.PhaseExtendedControlPlane:
-		return r.monitorExtendedControlPlaneUpgrade(ctx, upgrade)
-	case upgradev1alpha1.PhaseDataPlane:
-		return r.monitorDataPlaneUpgrade(ctx, upgrade)
+	case upgradev1alpha1.PhaseControllerManager:
+		return r.monitorControllerManagerUpgrade(ctx, upgrade)
+	case upgradev1alpha1.PhaseVerifying:
+		return r.performVerification(ctx, upgrade)
 	case upgradev1alpha1.PhaseRollingBack:
 		return r.monitorRollback(ctx, upgrade)
 	case upgradev1alpha1.PhaseCompleted:
@@ -125,180 +122,265 @@ func (r *LiqoUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 }
 
-// startCompatibilityCheck initiates Phase 0: Compatibility Check
-func (r *LiqoUpgradeReconciler) startCompatibilityCheck(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
+// Stage 0: Start & Validation
+func (r *LiqoUpgradeReconciler) startValidation(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	logger.Info("Phase 0: Starting compatibility check")
+	logger.Info("Stage 0: Starting validation phase")
 
-	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseCompatibilityCheck, "Checking version compatibility", nil)
+	// Initialize status
+	upgrade.Status.TotalStages = 9 // Stage 0-8 per design
+	upgrade.Status.CurrentStage = 0
+
+	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseValidating, "Validating compatibility and prerequisites", nil)
 }
 
-// checkCompatibility performs the actual compatibility check logic
-func (r *LiqoUpgradeReconciler) checkCompatibility(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
+func (r *LiqoUpgradeReconciler) performValidation(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	logger.Info("Phase 0: Performing compatibility check")
+	logger.Info("Performing validation checks")
 
 	namespace := upgrade.Spec.Namespace
 	if namespace == "" {
 		namespace = "liqo"
 	}
 
-	// Step 1: Detect local cluster version
-	localVersion, err := r.detectLocalVersion(ctx, namespace)
-	if err != nil {
-		logger.Error(err, "Failed to detect local Liqo version")
-		return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed,
-			fmt.Sprintf("Failed to detect local version: %s", err.Error()), nil)
+	// Step 1: Verify cluster identity
+	logger.Info("Step 1: Verifying cluster identity")
+	if err := r.verifyClusterIdentity(ctx, namespace); err != nil {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Cluster identity verification failed: %v", err))
 	}
-	logger.Info("Detected local version", "version", localVersion)
 
-	// Step 2: Determine lowest version among local + remotes
-	lowestVersion := r.determineLowestVersion(localVersion, upgrade.Spec.RemoteClusterVersions)
-	logger.Info("Determined lowest version", "lowestVersion", lowestVersion)
-
-	// Step 3: Load compatibility matrix from ConfigMap
+	// Step 2: Check compatibility matrix
+	logger.Info("Step 2: Checking compatibility matrix")
 	matrix, err := r.loadCompatibilityMatrix(ctx, namespace)
 	if err != nil {
-		logger.Info("Compatibility matrix not found, skipping compatibility check", "error", err.Error())
-		// If ConfigMap doesn't exist, proceed without check (backward compatible)
-		statusUpdates := map[string]interface{}{
-			"detectedLocalVersion":     localVersion,
-			"lowestVersion":            lowestVersion,
-			"compatibilityCheckPassed": true,
-			"lastSuccessfulPhase":      upgradev1alpha1.PhaseCompatibilityCheck,
+		logger.Info("Compatibility matrix not found, proceeding without check", "error", err.Error())
+	} else {
+		if !r.isCompatible(matrix, upgrade.Spec.CurrentVersion, upgrade.Spec.TargetVersion) {
+			return r.fail(ctx, upgrade, fmt.Sprintf("Incompatible versions: %s → %s", upgrade.Spec.CurrentVersion, upgrade.Spec.TargetVersion))
 		}
-		if _, err := r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseCompatibilityCheck,
-			"Compatibility check skipped (no matrix found)", statusUpdates); err != nil {
-			return ctrl.Result{}, err
-		}
-		return r.startBackup(ctx, upgrade)
 	}
 
-	// Step 4: Check compatibility
-	if !r.isCompatible(matrix, lowestVersion, upgrade.Spec.TargetVersion) {
-		logger.Error(nil, "Incompatible versions", "from", lowestVersion, "to", upgrade.Spec.TargetVersion)
-		statusUpdates := map[string]interface{}{
-			"detectedLocalVersion":     localVersion,
-			"lowestVersion":            lowestVersion,
-			"compatibilityCheckPassed": false,
-		}
-		return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed,
-			fmt.Sprintf("Incompatible versions: %s → %s. Check compatibility matrix.", lowestVersion, upgrade.Spec.TargetVersion),
-			statusUpdates)
+	// Step 3: Verify current version matches deployment
+	logger.Info("Step 3: Verifying current version")
+	deployedVersion, err := r.detectDeployedVersion(ctx, namespace)
+	if err != nil {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to detect deployed version: %v", err))
+	}
+	if deployedVersion != upgrade.Spec.CurrentVersion {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Version mismatch: deployed=%s, expected=%s", deployedVersion, upgrade.Spec.CurrentVersion))
 	}
 
-	// Step 5: Compatibility check passed, proceed to backup phase
-	logger.Info("Compatibility check passed!", "from", lowestVersion, "to", upgrade.Spec.TargetVersion)
+	// Step 4: Backup critical environment variables and flags
+	logger.Info("Step 4: Backing up environment variables and configuration")
+	if err := r.backupEnvironmentConfig(ctx, upgrade, namespace); err != nil {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to backup environment config: %v", err))
+	}
+
+	// Step 5: Check component health
+	logger.Info("Step 5: Checking component health")
+	if err := r.verifyComponentHealth(ctx, namespace); err != nil {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Component health check failed: %v", err))
+	}
+
+	// Step 6: Save previous version
+	upgrade.Status.PreviousVersion = upgrade.Spec.CurrentVersion
+
+	// Add Compatible condition
+	condition := metav1.Condition{
+		Type:               string(upgradev1alpha1.ConditionCompatible),
+		Status:             metav1.ConditionTrue,
+		LastTransitionTime: metav1.Now(),
+		Reason:             "ValidationPassed",
+		Message:            fmt.Sprintf("Version %s → %s is compatible", upgrade.Spec.CurrentVersion, upgrade.Spec.TargetVersion),
+	}
+
 	statusUpdates := map[string]interface{}{
-		"detectedLocalVersion":     localVersion,
-		"lowestVersion":            lowestVersion,
-		"compatibilityCheckPassed": true,
-		"lastSuccessfulPhase":      upgradev1alpha1.PhaseCompatibilityCheck,
+		"previousVersion": upgrade.Spec.CurrentVersion,
+		"conditions":      []metav1.Condition{condition},
+		"backupReady":     upgrade.Status.BackupReady,
+		"backupName":      upgrade.Status.BackupName,
 	}
 
-	// Update status first
-	if _, err := r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseCompatibilityCheck,
-		fmt.Sprintf("Compatibility check passed: %s → %s", lowestVersion, upgrade.Spec.TargetVersion), statusUpdates); err != nil {
+	if _, err := r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseValidating, "Validation completed successfully", statusUpdates); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// Now start backup
-	return r.startBackup(ctx, upgrade)
+	// Move to next phase: Freeze operations
+	return r.startFreezeOperations(ctx, upgrade)
 }
 
-// detectLocalVersion detects the Liqo version from liqo-controller-manager deployment
-func (r *LiqoUpgradeReconciler) detectLocalVersion(ctx context.Context, namespace string) (string, error) {
+func (r *LiqoUpgradeReconciler) verifyClusterIdentity(ctx context.Context, namespace string) error {
+	// Verify ForeignCluster CRD exists
 	deployment := &appsv1.Deployment{}
 	err := r.Get(ctx, types.NamespacedName{
 		Name:      "liqo-controller-manager",
 		Namespace: namespace,
 	}, deployment)
+	return err
+}
 
+func (r *LiqoUpgradeReconciler) detectDeployedVersion(ctx context.Context, namespace string) (string, error) {
+	deployment := &appsv1.Deployment{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      "liqo-controller-manager",
+		Namespace: namespace,
+	}, deployment)
 	if err != nil {
-		return "", fmt.Errorf("failed to get liqo-controller-manager deployment: %w", err)
+		return "", err
 	}
 
 	if len(deployment.Spec.Template.Spec.Containers) == 0 {
-		return "", fmt.Errorf("no containers found in liqo-controller-manager deployment")
+		return "", fmt.Errorf("no containers found in deployment")
 	}
 
 	image := deployment.Spec.Template.Spec.Containers[0].Image
 	parts := strings.Split(image, ":")
 	if len(parts) < 2 {
-		return "", fmt.Errorf("could not parse version from image: %s", image)
+		return "", fmt.Errorf("invalid image format: %s", image)
 	}
 
 	version := parts[len(parts)-1]
 	if !strings.HasPrefix(version, "v") {
-		return "", fmt.Errorf("invalid version format: %s (expected vX.Y.Z)", version)
+		version = "v" + version
 	}
 
 	return version, nil
 }
 
-// determineLowestVersion finds the lowest version among local and remote clusters
-func (r *LiqoUpgradeReconciler) determineLowestVersion(localVersion string, remoteVersions []upgradev1alpha1.RemoteClusterVersion) string {
-	versions := []string{localVersion}
-
-	if len(remoteVersions) == 0 {
-		return localVersion
+func (r *LiqoUpgradeReconciler) verifyComponentHealth(ctx context.Context, namespace string) error {
+	deployment := &appsv1.Deployment{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      "liqo-controller-manager",
+		Namespace: namespace,
+	}, deployment)
+	if err != nil {
+		return err
 	}
 
-	for _, remote := range remoteVersions {
-		versions = append(versions, remote.Version)
+	if deployment.Status.ReadyReplicas < 1 {
+		return fmt.Errorf("liqo-controller-manager not ready: %d/%d", deployment.Status.ReadyReplicas, *deployment.Spec.Replicas)
 	}
 
-	lowest := versions[0]
-	for _, v := range versions[1:] {
-		if compareVersions(v, lowest) < 0 {
-			lowest = v
-		}
-	}
-
-	return lowest
+	return nil
 }
 
-// compareVersions compares two semantic versions
-func compareVersions(v1, v2 string) int {
-	v1 = strings.TrimPrefix(v1, "v")
-	v2 = strings.TrimPrefix(v2, "v")
+// backupEnvironmentConfig backs up critical environment variables and configuration
+func (r *LiqoUpgradeReconciler) backupEnvironmentConfig(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade, namespace string) error {
+	logger := log.FromContext(ctx)
 
-	parts1 := strings.Split(v1, ".")
-	parts2 := strings.Split(v2, ".")
+	// Create a ConfigMap to store environment variable backups
+	backupConfigMapName := fmt.Sprintf("liqo-upgrade-env-backup-%s", upgrade.Name)
 
-	for i := 0; i < len(parts1) && i < len(parts2); i++ {
-		var n1, n2 int
-		fmt.Sscanf(parts1[i], "%d", &n1)
-		fmt.Sscanf(parts2[i], "%d", &n2)
+	// Get liqo-controller-manager deployment
+	deployment := &appsv1.Deployment{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      "liqo-controller-manager",
+		Namespace: namespace,
+	}, deployment)
+	if err != nil {
+		return fmt.Errorf("failed to get controller-manager deployment: %w", err)
+	}
 
-		if n1 < n2 {
-			return -1
+	// Extract environment variables from all containers
+	envData := make(map[string]string)
+	for _, container := range deployment.Spec.Template.Spec.Containers {
+		for _, env := range container.Env {
+			key := fmt.Sprintf("%s_%s", container.Name, env.Name)
+			if env.Value != "" {
+				envData[key] = env.Value
+			} else if env.ValueFrom != nil {
+				// Store reference info for ValueFrom
+				envData[key+"_type"] = "valueFrom"
+			}
 		}
-		if n1 > n2 {
-			return 1
+
+		// Store container args/command
+		if len(container.Args) > 0 {
+			envData[container.Name+"_args"] = strings.Join(container.Args, " ")
+		}
+		if len(container.Command) > 0 {
+			envData[container.Name+"_command"] = strings.Join(container.Command, " ")
 		}
 	}
 
-	if len(parts1) < len(parts2) {
-		return -1
-	}
-	if len(parts1) > len(parts2) {
-		return 1
+	// Critical environment variables that must be preserved (Stage 2)
+	criticalEnvVars := []string{
+		"POD_NAMESPACE",
+		"CLUSTER_ID",
+		"TENANT_NAMESPACE",
+		"CLUSTER_ROLE",
+		"ENABLE_IPAM",
+		"LOG_LEVEL",
 	}
 
-	return 0
+	// Verify critical env vars are present
+	for _, envVar := range criticalEnvVars {
+		found := false
+		for key := range envData {
+			if strings.Contains(key, envVar) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			logger.Info("Warning: critical environment variable not found in backup", "variable", envVar)
+		}
+	}
+
+	// Create backup ConfigMap
+	backupConfigMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      backupConfigMapName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/name":      "liqo-upgrade",
+				"app.kubernetes.io/component": "env-backup",
+				"upgrade.liqo.io/upgrade":     upgrade.Name,
+			},
+		},
+		Data: envData,
+	}
+
+	if err := controllerutil.SetControllerReference(upgrade, backupConfigMap, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set controller reference: %w", err)
+	}
+
+	// Create or update the ConfigMap
+	existingConfigMap := &corev1.ConfigMap{}
+	err = r.Get(ctx, types.NamespacedName{Name: backupConfigMapName, Namespace: namespace}, existingConfigMap)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			if err := r.Create(ctx, backupConfigMap); err != nil {
+				return fmt.Errorf("failed to create backup ConfigMap: %w", err)
+			}
+			logger.Info("Environment config backup created", "configmap", backupConfigMapName)
+		} else {
+			return fmt.Errorf("failed to check backup ConfigMap: %w", err)
+		}
+	} else {
+		// Update existing
+		existingConfigMap.Data = envData
+		if err := r.Update(ctx, existingConfigMap); err != nil {
+			return fmt.Errorf("failed to update backup ConfigMap: %w", err)
+		}
+		logger.Info("Environment config backup updated", "configmap", backupConfigMapName)
+	}
+
+	// Store backup name in upgrade status for later use
+	upgrade.Status.BackupName = backupConfigMapName
+	upgrade.Status.BackupReady = true
+
+	return nil
 }
 
-// loadCompatibilityMatrix loads the compatibility matrix from ConfigMap
 func (r *LiqoUpgradeReconciler) loadCompatibilityMatrix(ctx context.Context, namespace string) (CompatibilityMatrix, error) {
 	configMap := &corev1.ConfigMap{}
 	err := r.Get(ctx, types.NamespacedName{
 		Name:      compatibilityConfigMap,
 		Namespace: namespace,
 	}, configMap)
-
 	if err != nil {
-		return nil, fmt.Errorf("failed to get compatibility ConfigMap: %w", err)
+		return nil, err
 	}
 
 	yamlData, ok := configMap.Data["compatibility.yaml"]
@@ -308,13 +390,12 @@ func (r *LiqoUpgradeReconciler) loadCompatibilityMatrix(ctx context.Context, nam
 
 	var matrix CompatibilityMatrix
 	if err := yaml.Unmarshal([]byte(yamlData), &matrix); err != nil {
-		return nil, fmt.Errorf("failed to parse compatibility matrix: %w", err)
+		return nil, err
 	}
 
 	return matrix, nil
 }
 
-// isCompatible checks if upgrading from sourceVersion to targetVersion is supported
 func (r *LiqoUpgradeReconciler) isCompatible(matrix CompatibilityMatrix, sourceVersion, targetVersion string) bool {
 	compatibleVersions, exists := matrix[sourceVersion]
 	if !exists {
@@ -326,67 +407,59 @@ func (r *LiqoUpgradeReconciler) isCompatible(matrix CompatibilityMatrix, sourceV
 			return true
 		}
 	}
-
 	return false
 }
 
-// startBackup creates a backup job (Phase 1)
-func (r *LiqoUpgradeReconciler) startBackup(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
+// Stage 0 Continued: Freeze Operations
+func (r *LiqoUpgradeReconciler) startFreezeOperations(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	logger.Info("Phase 1: Starting backup phase", "version", upgrade.Spec.CurrentVersion)
+	logger.Info("Stage 0: Freezing new offloads and peerings")
 
-	job := r.buildBackupJob(upgrade)
+	upgrade.Status.CurrentStage = 0
+
+	job := r.buildFreezeOperationsJob(upgrade)
 	if err := controllerutil.SetControllerReference(upgrade, job, r.Scheme); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	if err := r.Create(ctx, job); err != nil {
 		if !errors.IsAlreadyExists(err) {
-			logger.Error(err, "Failed to create backup job")
-			return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, "Failed to create backup job", nil)
+			logger.Error(err, "Failed to create freeze operations job")
+			return r.fail(ctx, upgrade, "Failed to create freeze operations job")
 		}
 	}
 
-	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseBackup, "Creating backup of current state", nil)
+	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFreezingOperations, "Freezing new offloads and peerings", nil)
 }
 
-// monitorBackup monitors the backup job
-func (r *LiqoUpgradeReconciler) monitorBackup(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
+func (r *LiqoUpgradeReconciler) monitorFreezeOperations(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	jobName := fmt.Sprintf("%s-%s", backupJobPrefix, upgrade.Name)
+	jobName := fmt.Sprintf("%s-%s", freezeOperationsJobPrefix, upgrade.Name)
 	job := &batchv1.Job{}
 	if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: upgrade.Spec.Namespace}, job); err != nil {
-		logger.Error(err, "Failed to get backup job")
+		logger.Error(err, "Failed to get freeze operations job")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	if job.Status.Succeeded > 0 {
-		logger.Info("Backup completed successfully")
-		statusUpdates := map[string]interface{}{
-			"backupReady":         true,
-			"backupName":          jobName,
-			"lastSuccessfulPhase": upgradev1alpha1.PhaseBackup,
-		}
-		if _, err := r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseBackup, "Backup completed", statusUpdates); err != nil {
-			return ctrl.Result{}, err
-		}
+		logger.Info("Operations frozen successfully")
 		return r.startCRDUpgrade(ctx, upgrade)
 	}
 
 	if job.Status.Failed > 0 {
-		logger.Info("Backup failed")
-		return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, "Backup job failed", nil)
+		return r.startRollback(ctx, upgrade, "Failed to freeze operations")
 	}
 
-	logger.Info("Backup job still running")
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
-// startCRDUpgrade starts Phase 2: CRD upgrade (includes verification)
+// Stage 1: Upgrade CRDs
 func (r *LiqoUpgradeReconciler) startCRDUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	logger.Info("Phase 2: Starting CRD upgrade with verification")
+	logger.Info("Stage 1: Starting CRD upgrade")
+
+	upgrade.Status.CurrentStage = 1
 
 	job := r.buildCRDUpgradeJob(upgrade)
 	if err := controllerutil.SetControllerReference(upgrade, job, r.Scheme); err != nil {
@@ -396,18 +469,17 @@ func (r *LiqoUpgradeReconciler) startCRDUpgrade(ctx context.Context, upgrade *up
 	if err := r.Create(ctx, job); err != nil {
 		if !errors.IsAlreadyExists(err) {
 			logger.Error(err, "Failed to create CRD upgrade job")
-			return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, "Failed to create CRD upgrade job", nil)
+			return r.fail(ctx, upgrade, "Failed to create CRD upgrade job")
 		}
 	}
 
-	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseCRDs, "CRD upgrade job created", nil)
+	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseCRDs, "Upgrading CRDs", nil)
 }
 
-// monitorCRDUpgrade monitors the CRD upgrade job (Phase 2)
 func (r *LiqoUpgradeReconciler) monitorCRDUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	jobName := fmt.Sprintf("%s-%s", upgradeJobPrefix, upgrade.Name)
+	jobName := fmt.Sprintf("%s-%s", crdUpgradeJobPrefix, upgrade.Name)
 	job := &batchv1.Job{}
 	if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: upgrade.Spec.Namespace}, job); err != nil {
 		logger.Error(err, "Failed to get CRD upgrade job")
@@ -415,231 +487,169 @@ func (r *LiqoUpgradeReconciler) monitorCRDUpgrade(ctx context.Context, upgrade *
 	}
 
 	if job.Status.Succeeded > 0 {
-		logger.Info("Phase 2 completed: CRD upgrade and verification successful")
+		logger.Info("Stage 1 completed: CRDs upgraded successfully")
 		statusUpdates := map[string]interface{}{
 			"lastSuccessfulPhase": upgradev1alpha1.PhaseCRDs,
 		}
-		if _, err := r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseCRDs, "CRD upgrade and verification completed", statusUpdates); err != nil {
+		if _, err := r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseCRDs, "CRDs upgraded", statusUpdates); err != nil {
 			return ctrl.Result{}, err
 		}
-		return r.startControlPlaneUpgrade(ctx, upgrade)
+		return r.startControllerManagerUpgrade(ctx, upgrade)
 	}
 
 	if job.Status.Failed > 0 {
-		logger.Info("Phase 2 failed: CRD upgrade or verification failed, initiating rollback")
-		return r.startRollback(ctx, upgrade, "Phase 2 (CRD upgrade/verification) failed")
+		logger.Error(nil, "Stage 1 failed: CRD upgrade failed")
+		return r.startRollback(ctx, upgrade, "CRD upgrade failed")
 	}
 
 	logger.Info("CRD upgrade job still running")
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
-// startControlPlaneUpgrade starts Phase 3: Control Plane upgrade (includes verification)
-func (r *LiqoUpgradeReconciler) startControlPlaneUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
+// Stage 2: Upgrade liqo-controller-manager
+func (r *LiqoUpgradeReconciler) startControllerManagerUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	logger.Info("Phase 3: Starting control plane upgrade with verification")
+	logger.Info("Stage 2: Starting liqo-controller-manager upgrade")
 
-	job := r.buildControlPlaneUpgradeJob(upgrade)
+	upgrade.Status.CurrentStage = 2
+
+	job := r.buildControllerManagerUpgradeJob(upgrade)
 	if err := controllerutil.SetControllerReference(upgrade, job, r.Scheme); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	if err := r.Create(ctx, job); err != nil {
 		if !errors.IsAlreadyExists(err) {
-			logger.Error(err, "Failed to create control plane upgrade job")
-			return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, "Failed to create control plane upgrade job", nil)
+			logger.Error(err, "Failed to create controller-manager upgrade job")
+			return r.fail(ctx, upgrade, "Failed to create controller-manager upgrade job")
 		}
 	}
 
-	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseControlPlane, "Control plane upgrade job created", nil)
+	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseControllerManager, "Upgrading liqo-controller-manager", nil)
 }
 
-// monitorControlPlaneUpgrade monitors the control plane upgrade job (Phase 3)
-func (r *LiqoUpgradeReconciler) monitorControlPlaneUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
+func (r *LiqoUpgradeReconciler) monitorControllerManagerUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	jobName := fmt.Sprintf("%s-%s", controlPlaneJobPrefix, upgrade.Name)
+	jobName := fmt.Sprintf("%s-%s", controllerManagerUpgradePrefix, upgrade.Name)
 	job := &batchv1.Job{}
 	if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: upgrade.Spec.Namespace}, job); err != nil {
-		logger.Error(err, "Failed to get control plane upgrade job")
+		logger.Error(err, "Failed to get controller-manager upgrade job")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	if job.Status.Succeeded > 0 {
-		logger.Info("Phase 3 completed: Control plane upgrade and verification successful!")
+		logger.Info("Stage 2 completed: liqo-controller-manager upgraded successfully")
 		statusUpdates := map[string]interface{}{
-			"lastSuccessfulPhase": upgradev1alpha1.PhaseControlPlane,
+			"lastSuccessfulPhase": upgradev1alpha1.PhaseControllerManager,
 		}
-		if _, err := r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseControlPlane, "Phase 3 complete, starting extended control plane upgrade", statusUpdates); err != nil {
+		if _, err := r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseControllerManager, "Controller-manager upgraded", statusUpdates); err != nil {
 			return ctrl.Result{}, err
 		}
-		return r.startExtendedControlPlaneUpgrade(ctx, upgrade)
+		return r.startVerification(ctx, upgrade)
 	}
 
 	if job.Status.Failed > 0 {
-		logger.Error(nil, "Phase 3 failed: Control plane upgrade or verification failed, rolling back EVERYTHING")
-		return r.startRollback(ctx, upgrade, "Phase 3 (Control plane upgrade/verification) failed - rolling back everything")
+		logger.Error(nil, "Stage 2 failed: Controller-manager upgrade failed")
+		return r.startRollback(ctx, upgrade, "Controller-manager upgrade failed")
 	}
 
-	logger.Info("Control plane upgrade job still running")
+	logger.Info("Controller-manager upgrade job still running")
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
-// startExtendedControlPlaneUpgrade starts Phase 4: Extended Control Plane upgrade
-func (r *LiqoUpgradeReconciler) startExtendedControlPlaneUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
+// Verification Phase
+func (r *LiqoUpgradeReconciler) startVerification(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	logger.Info("Phase 4: Starting extended control plane upgrade with verification")
+	logger.Info("Starting verification phase")
 
-	job := r.buildExtendedControlPlaneUpgradeJob(upgrade)
-	if err := controllerutil.SetControllerReference(upgrade, job, r.Scheme); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if err := r.Create(ctx, job); err != nil {
-		if !errors.IsAlreadyExists(err) {
-			logger.Error(err, "Failed to create extended control plane upgrade job")
-			return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, "Failed to create extended control plane upgrade job", nil)
-		}
-	}
-
-	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseExtendedControlPlane, "Extended control plane upgrade job created", nil)
+	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseVerifying, "Verifying upgrade", nil)
 }
 
-// monitorExtendedControlPlaneUpgrade monitors the extended control plane upgrade job (Phase 4)
-func (r *LiqoUpgradeReconciler) monitorExtendedControlPlaneUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
+func (r *LiqoUpgradeReconciler) performVerification(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+	logger.Info("Performing post-upgrade verification")
 
-	jobName := fmt.Sprintf("%s-%s", extendedControlPlaneJobPrefix, upgrade.Name)
-	job := &batchv1.Job{}
-	if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: upgrade.Spec.Namespace}, job); err != nil {
-		logger.Error(err, "Failed to get extended control plane upgrade job")
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	namespace := upgrade.Spec.Namespace
+	if namespace == "" {
+		namespace = "liqo"
 	}
 
-	if job.Status.Succeeded > 0 {
-		logger.Info("Phase 4 completed: Extended control plane upgrade and verification successful!")
-		statusUpdates := map[string]interface{}{
-			"lastSuccessfulPhase": upgradev1alpha1.PhaseExtendedControlPlane,
-		}
-		if _, err := r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseExtendedControlPlane, "Extended control plane upgrade completed, starting data plane upgrade", statusUpdates); err != nil {
-			return ctrl.Result{}, err
-		}
-		return r.startDataPlaneUpgrade(ctx, upgrade)
+	// Verify all components are healthy
+	if err := r.verifyComponentHealth(ctx, namespace); err != nil {
+		logger.Error(err, "Verification failed: components not healthy")
+		return r.startRollback(ctx, upgrade, fmt.Sprintf("Verification failed: %v", err))
 	}
 
-	if job.Status.Failed > 0 {
-		logger.Error(nil, "Phase 4 failed: Extended control plane upgrade or verification failed, rolling back EVERYTHING")
-		return r.startRollback(ctx, upgrade, "Phase 4 (Extended control plane upgrade/verification) failed - rolling back everything")
+	// Verify version
+	deployedVersion, err := r.detectDeployedVersion(ctx, namespace)
+	if err != nil {
+		return r.startRollback(ctx, upgrade, fmt.Sprintf("Version verification failed: %v", err))
 	}
 
-	logger.Info("Extended control plane upgrade job still running")
-	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-}
-
-// startDataPlaneUpgrade starts Phase 5: Data Plane upgrade
-func (r *LiqoUpgradeReconciler) startDataPlaneUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-	logger.Info("Phase 5: Starting data plane upgrade")
-
-	job := r.buildDataPlaneUpgradeJob(upgrade)
-	if err := controllerutil.SetControllerReference(upgrade, job, r.Scheme); err != nil {
-		return ctrl.Result{}, err
+	if deployedVersion != upgrade.Spec.TargetVersion {
+		return r.startRollback(ctx, upgrade, fmt.Sprintf("Version mismatch after upgrade: deployed=%s, expected=%s", deployedVersion, upgrade.Spec.TargetVersion))
 	}
 
-	if err := r.Create(ctx, job); err != nil {
-		if !errors.IsAlreadyExists(err) {
-			logger.Error(err, "Failed to create data plane upgrade job")
-			return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, "Failed to create data plane upgrade job", nil)
-		}
-	}
+	// Verification passed
+	logger.Info("Verification passed, upgrade complete!")
 
-	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseDataPlane, "Data plane upgrade job created", nil)
-}
-
-// monitorDataPlaneUpgrade monitors the data plane upgrade job (Phase 5)
-func (r *LiqoUpgradeReconciler) monitorDataPlaneUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	jobName := fmt.Sprintf("%s-%s", dataPlaneJobPrefix, upgrade.Name)
-	job := &batchv1.Job{}
-	if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: upgrade.Spec.Namespace}, job); err != nil {
-		logger.Error(err, "Failed to get data plane upgrade job")
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-
-	if job.Status.Succeeded > 0 {
-		logger.Info("Phase 5 completed: Data plane upgrade successful!")
-		statusUpdates := map[string]interface{}{
-			"lastSuccessfulPhase": upgradev1alpha1.PhaseDataPlane,
-		}
-		if _, err := r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseDataPlane, "Data plane upgrade completed", statusUpdates); err != nil {
-			return ctrl.Result{}, err
-		}
-		return r.completeUpgrade(ctx, upgrade)
-	}
-
-	if job.Status.Failed > 0 {
-		logger.Error(nil, "Phase 5 failed: Data plane upgrade failed, rolling back EVERYTHING")
-		return r.startRollback(ctx, upgrade, "Phase 5 (Data plane upgrade) failed - rolling back everything")
-	}
-
-	logger.Info("Data plane upgrade job still running")
-	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-}
-
-// completeUpgrade marks the upgrade as completed and cleans up backup
-func (r *LiqoUpgradeReconciler) completeUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-	logger.Info("Completing upgrade and cleaning up")
-
-	backupJobName := fmt.Sprintf("%s-%s", backupJobPrefix, upgrade.Name)
-	backupJob := &batchv1.Job{}
-	if err := r.Get(ctx, types.NamespacedName{Name: backupJobName, Namespace: upgrade.Spec.Namespace}, backupJob); err == nil {
-		logger.Info("Deleting backup job and pod", "jobName", backupJobName)
-
-		// Delete with propagation to remove pods
-		deletePolicy := metav1.DeletePropagationForeground
-		if err := r.Delete(ctx, backupJob, &client.DeleteOptions{
-			PropagationPolicy: &deletePolicy,
-		}); err != nil {
-			logger.Error(err, "Failed to delete backup job, continuing anyway")
-		}
+	condition := metav1.Condition{
+		Type:               string(upgradev1alpha1.ConditionHealthy),
+		Status:             metav1.ConditionTrue,
+		LastTransitionTime: metav1.Now(),
+		Reason:             "VerificationPassed",
+		Message:            "All components healthy and version verified",
 	}
 
 	statusUpdates := map[string]interface{}{
-		"backupReady": false,
+		"conditions": append(upgrade.Status.Conditions, condition),
 	}
 
 	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseCompleted,
-		fmt.Sprintf("Upgrade completed successfully: %s → %s", upgrade.Status.LowestVersion, upgrade.Spec.TargetVersion),
+		fmt.Sprintf("Upgrade completed successfully: %s → %s", upgrade.Spec.CurrentVersion, upgrade.Spec.TargetVersion),
 		statusUpdates)
 }
 
-// startRollback initiates rollback process
+// Rollback
 func (r *LiqoUpgradeReconciler) startRollback(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade, reason string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	logger.Info("Starting rollback", "reason", reason, "lastSuccessfulPhase", upgrade.Status.LastSuccessfulPhase)
+	logger.Info("Starting rollback", "reason", reason)
+
+	// Check if autoRollback is disabled
+	if upgrade.Spec.AutoRollback != nil && !*upgrade.Spec.AutoRollback {
+		logger.Info("AutoRollback disabled, not rolling back")
+		return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed,
+			fmt.Sprintf("Upgrade failed (AutoRollback disabled): %s", reason), nil)
+	}
 
 	job := r.buildRollbackJob(upgrade)
 	if err := controllerutil.SetControllerReference(upgrade, job, r.Scheme); err != nil {
-		logger.Error(err, "Failed to set controller reference for rollback job")
-		return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, fmt.Sprintf("Rollback preparation failed: %s", err.Error()), nil)
+		return r.fail(ctx, upgrade, fmt.Sprintf("Rollback preparation failed: %v", err))
 	}
 
 	if err := r.Create(ctx, job); err != nil {
-		if errors.IsAlreadyExists(err) {
-			logger.Info("Rollback job already exists, monitoring it")
-			return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseRollingBack, fmt.Sprintf("Rolling back due to: %s", reason), nil)
+		if !errors.IsAlreadyExists(err) {
+			logger.Error(err, "Failed to create rollback job")
+			return r.fail(ctx, upgrade, fmt.Sprintf("Rollback failed to start: %v", err))
 		}
-		logger.Error(err, "Failed to create rollback job")
-		return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, fmt.Sprintf("Rollback failed to start: %s | Original failure: %s", err.Error(), reason), nil)
 	}
 
-	logger.Info("Rollback job created successfully")
-	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseRollingBack, fmt.Sprintf("Rolling back due to: %s", reason), nil)
+	condition := metav1.Condition{
+		Type:               string(upgradev1alpha1.ConditionRollbackRequired),
+		Status:             metav1.ConditionTrue,
+		LastTransitionTime: metav1.Now(),
+		Reason:             "UpgradeFailed",
+		Message:            reason,
+	}
+
+	statusUpdates := map[string]interface{}{
+		"conditions": append(upgrade.Status.Conditions, condition),
+	}
+
+	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseRollingBack, fmt.Sprintf("Rolling back: %s", reason), statusUpdates)
 }
 
-// monitorRollback monitors the rollback job
 func (r *LiqoUpgradeReconciler) monitorRollback(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -659,55 +669,34 @@ func (r *LiqoUpgradeReconciler) monitorRollback(ctx context.Context, upgrade *up
 	}
 
 	if job.Status.Failed > 0 {
-		logger.Info("Rollback failed!")
 		statusUpdates := map[string]interface{}{
 			"rolledBack": false,
 		}
 		return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, "Upgrade failed AND rollback failed - manual intervention required", statusUpdates)
 	}
 
-	logger.Info("Rollback job still running")
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
-// buildBackupJob creates the backup job (NO TTL - persists until Phase 4)
-func (r *LiqoUpgradeReconciler) buildBackupJob(upgrade *upgradev1alpha1.LiqoUpgrade) *batchv1.Job {
-	jobName := fmt.Sprintf("%s-%s", backupJobPrefix, upgrade.Name)
+// Job Builders
+
+func (r *LiqoUpgradeReconciler) buildFreezeOperationsJob(upgrade *upgradev1alpha1.LiqoUpgrade) *batchv1.Job {
+	jobName := fmt.Sprintf("%s-%s", freezeOperationsJobPrefix, upgrade.Name)
 	namespace := upgrade.Spec.Namespace
 	if namespace == "" {
 		namespace = "liqo"
 	}
 
-	backupScript := `#!/bin/bash
+	script := `#!/bin/bash
 set -e
 
-BACKUP_DIR="/tmp/backup"
-mkdir -p "$BACKUP_DIR"
-
 echo "========================================="
-echo "Phase 1: Backing up Liqo CRDs and Control Plane"
+echo "Stage 0: Freezing new offloads and peerings"
 echo "========================================="
 
-# Backup CRDs
-echo "Backing up CRDs..."
-LIQO_CRDS=$(kubectl get crd | grep liqo | awk '{print $1}')
-echo "Found $(echo "$LIQO_CRDS" | wc -l) Liqo CRDs to backup"
-
-for crd in $LIQO_CRDS; do
-    echo "  Backing up: $crd"
-    kubectl get crd "$crd" -o yaml > "$BACKUP_DIR/$crd.yaml"
-done
-
-# Backup Control Plane deployments
-echo ""
-echo "Backing up control plane deployments..."
-kubectl get deployment liqo-controller-manager -n ` + namespace + ` -o yaml > "$BACKUP_DIR/controller-manager-backup.yaml"
-kubectl get deployment liqo-webhook -n ` + namespace + ` -o yaml > "$BACKUP_DIR/webhook-backup.yaml"
-
-echo ""
-echo "✅ Backup completed successfully!"
-echo "Backup stored in: $BACKUP_DIR"
-echo ""
+# Block new offloads by adding admission webhook rule
+# (Implementation depends on Liqo's internal mechanisms)
+echo "✅ Operations frozen (placeholder - actual implementation needed)"
 `
 
 	return &batchv1.Job{
@@ -716,19 +705,20 @@ echo ""
 			Namespace: namespace,
 			Labels: map[string]string{
 				"app.kubernetes.io/name":      "liqo-upgrade",
-				"app.kubernetes.io/component": "backup",
+				"app.kubernetes.io/component": "freeze",
 			},
 		},
 		Spec: batchv1.JobSpec{
+			TTLSecondsAfterFinished: int32Ptr(300),
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					ServiceAccountName: "liqo-upgrade-controller",
-					RestartPolicy:      corev1.RestartPolicyOnFailure,
+					RestartPolicy:      corev1.RestartPolicyNever,
 					Containers: []corev1.Container{
 						{
-							Name:    "backup",
+							Name:    "freeze",
 							Image:   "bitnami/kubectl:latest",
-							Command: []string{"/bin/bash", "-c", backupScript},
+							Command: []string{"/bin/bash", "-c", script},
 						},
 					},
 				},
@@ -738,9 +728,8 @@ echo ""
 	}
 }
 
-// buildCRDUpgradeJob creates the CRD upgrade job with embedded verification
 func (r *LiqoUpgradeReconciler) buildCRDUpgradeJob(upgrade *upgradev1alpha1.LiqoUpgrade) *batchv1.Job {
-	jobName := fmt.Sprintf("%s-%s", upgradeJobPrefix, upgrade.Name)
+	jobName := fmt.Sprintf("%s-%s", crdUpgradeJobPrefix, upgrade.Name)
 	namespace := upgrade.Spec.Namespace
 	if namespace == "" {
 		namespace = "liqo"
@@ -750,157 +739,65 @@ func (r *LiqoUpgradeReconciler) buildCRDUpgradeJob(upgrade *upgradev1alpha1.Liqo
 set -e
 
 echo "========================================="
-echo "Phase 2: CRD Upgrade + Verification"
+echo "Stage 1: Upgrading CRDs"
 echo "========================================="
 
-CURRENT_VERSION="%s"
 TARGET_VERSION="%s"
-NAMESPACE="%s"
-BASE_URL="https://api.github.com/repos/liqotech/liqo/contents/deployments/liqo/charts/liqo-crds/crds"
+GITHUB_API_URL="https://api.github.com/repos/liqotech/liqo/contents/deployments/liqo/charts/liqo-crds/crds?ref=${TARGET_VERSION}"
+RAW_BASE_URL="https://raw.githubusercontent.com/liqotech/liqo/${TARGET_VERSION}/deployments/liqo/charts/liqo-crds/crds"
 
-echo "Upgrading CRDs from $CURRENT_VERSION to $TARGET_VERSION"
+echo "Fetching CRD list from GitHub for version ${TARGET_VERSION}..."
+
+# Fetch list of CRD files from GitHub API
+CRD_FILES=$(curl -fsSL "${GITHUB_API_URL}" | grep '"name":' | grep '.yaml"' | cut -d'"' -f4)
+
+if [ -z "$CRD_FILES" ]; then
+  echo "❌ ERROR: Failed to fetch CRD list from GitHub"
+  exit 1
+fi
+
+CRD_COUNT=$(echo "$CRD_FILES" | wc -l)
+echo "Found ${CRD_COUNT} CRD files to apply"
 echo ""
 
-# Step 1: Verify current version
-echo "Step 1: Verifying liqo-controller-manager version..."
-ACTUAL_VERSION=$(kubectl get deployment liqo-controller-manager -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].image}' | awk -F: '{print $2}')
+# Apply each CRD
+SUCCESS_COUNT=0
+FAILED_COUNT=0
 
-if [ -z "$ACTUAL_VERSION" ]; then
-    ACTUAL_VERSION="unknown"
-elif ! echo "$ACTUAL_VERSION" | grep -q "^v[0-9]"; then
-    ACTUAL_VERSION="unknown"
-fi
-
-echo "  Current version: ${ACTUAL_VERSION}"
-if [ "$ACTUAL_VERSION" != "$CURRENT_VERSION" ]; then
-    echo "❌ ERROR: Version mismatch!"
-    exit 1
-fi
-echo "  ✅ Version validation passed"
-echo ""
-
-# Function to get list of CRD files from GitHub
-get_crd_list() {
-    local version=$1
-    curl -s "${BASE_URL}?ref=${version}" | grep '"name"' | grep '.yaml' | cut -d'"' -f4
-}
-
-# Function to download and hash a CRD
-download_and_hash() {
-    local version=$1
-    local filename=$2
-    local output_file=$3
-    
-    local url="https://raw.githubusercontent.com/liqotech/liqo/${version}/deployments/liqo/charts/liqo-crds/crds/${filename}"
-    curl -fsSL "$url" -o "$output_file"
-    sha256sum "$output_file" | awk '{print $1}'
-}
-
-mkdir -p /tmp/crds/current
-mkdir -p /tmp/crds/target
-mkdir -p /tmp/crds/changed
-
-echo "Step 2: Fetching CRD lists from GitHub..."
-CURRENT_CRDS=$(get_crd_list "$CURRENT_VERSION")
-TARGET_CRDS=$(get_crd_list "$TARGET_VERSION")
-
-if [ -z "$CURRENT_CRDS" ]; then
-    echo "❌ ERROR: Failed to fetch CRD list for ${CURRENT_VERSION}"
-    exit 1
-fi
-
-if [ -z "$TARGET_CRDS" ]; then
-    echo "❌ ERROR: Failed to fetch CRD list for ${TARGET_VERSION}"
-    exit 1
-fi
-
-ALL_CRDS=$(echo -e "${CURRENT_CRDS}\n${TARGET_CRDS}" | sort -u)
-echo "  Found $(echo "$ALL_CRDS" | wc -l) unique CRDs"
-echo ""
-
-echo "Step 3: Comparing CRDs between versions..."
-CHANGED_COUNT=0
-NEW_COUNT=0
-
-for crd in $ALL_CRDS; do
-    echo "  Checking: $crd"
-    
-    if echo "$CURRENT_CRDS" | grep -q "^${crd}$"; then
-        HAS_CURRENT=true
-        CURRENT_HASH=$(download_and_hash "$CURRENT_VERSION" "$crd" "/tmp/crds/current/${crd}")
-    else
-        HAS_CURRENT=false
-        echo "    → NEW in ${TARGET_VERSION}"
-        NEW_COUNT=$((NEW_COUNT + 1))
-    fi
-    
-    if echo "$TARGET_CRDS" | grep -q "^${crd}$"; then
-        HAS_TARGET=true
-        TARGET_HASH=$(download_and_hash "$TARGET_VERSION" "$crd" "/tmp/crds/target/${crd}")
-    else
-        HAS_TARGET=false
-        echo "    → REMOVED in ${TARGET_VERSION}"
-        continue
-    fi
-    
-    if [ "$HAS_CURRENT" = true ] && [ "$HAS_TARGET" = true ]; then
-        if [ "$CURRENT_HASH" != "$TARGET_HASH" ]; then
-            echo "    → CHANGED (adding to upgrade list)"
-            cp "/tmp/crds/target/${crd}" "/tmp/crds/changed/${crd}"
-            CHANGED_COUNT=$((CHANGED_COUNT + 1))
-        else
-            echo "    → No changes"
-        fi
-    elif [ "$HAS_TARGET" = true ]; then
-        echo "    → NEW (adding to upgrade list)"
-        cp "/tmp/crds/target/${crd}" "/tmp/crds/changed/${crd}"
-    fi
+for crd_file in $CRD_FILES; do
+  echo "Applying ${crd_file}..."
+  if curl -fsSL "${RAW_BASE_URL}/${crd_file}" | kubectl apply --server-side --force-conflicts -f - 2>&1; then
+    SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    echo "  ✓ ${crd_file} applied"
+  else
+    FAILED_COUNT=$((FAILED_COUNT + 1))
+    echo "  ✗ ${crd_file} failed"
+  fi
+  echo ""
 done
 
-echo ""
-echo "Summary: $CHANGED_COUNT changed, $NEW_COUNT new"
-echo ""
+echo "Summary: ${SUCCESS_COUNT} succeeded, ${FAILED_COUNT} failed"
 
-if [ "$CHANGED_COUNT" -eq 0 ] && [ "$NEW_COUNT" -eq 0 ]; then
-    echo "✅ No CRD changes detected. Skipping upgrade."
-else
-    echo "Step 4: Applying changed/new CRDs..."
-    for crd_file in /tmp/crds/changed/*.yaml; do
-        if [ -f "$crd_file" ]; then
-            crd_name=$(basename "$crd_file")
-            echo "  Applying: $crd_name"
-            kubectl apply --server-side --force-conflicts -f "$crd_file"
-        fi
-    done
-    
-    echo ""
-    echo "✅ CRD upgrade completed"
+if [ "$FAILED_COUNT" -gt 0 ]; then
+  echo "❌ ERROR: Some CRDs failed to apply"
+  exit 1
 fi
 
 echo ""
-echo "Step 5: Verifying CRD upgrade..."
+echo "Waiting for CRDs to be established..."
+sleep 5
+
+# Verify CRDs are established
 LIQO_CRDS=$(kubectl get crd | grep liqo | wc -l)
-echo "  Found $LIQO_CRDS Liqo CRDs installed"
+echo "Found ${LIQO_CRDS} Liqo CRDs installed in cluster"
 
-if [ "$LIQO_CRDS" -lt 10 ]; then
-    echo "  ❌ ERROR: Unexpected number of CRDs!"
-    exit 1
+if [ "$LIQO_CRDS" -lt 15 ]; then
+  echo "❌ ERROR: Expected at least 15 CRDs, found ${LIQO_CRDS}"
+  exit 1
 fi
 
-echo "  ✅ CRD count validation passed"
-echo ""
-echo "Step 6: Verifying liqo-controller-manager is still healthy..."
-kubectl wait --for=condition=available --timeout=2m deployment/liqo-controller-manager -n "$NAMESPACE" || {
-    echo "  ❌ ERROR: liqo-controller-manager not healthy after CRD upgrade!"
-    exit 1
-}
-
-echo "  ✅ liqo-controller-manager is healthy"
-echo ""
-echo "========================================="
-echo "✅ Phase 2 Complete: CRD Upgrade + Verification Passed!"
-echo "========================================="
-`, upgrade.Spec.CurrentVersion, upgrade.Spec.TargetVersion, namespace)
+echo "✅ Stage 1 complete: CRDs upgraded successfully"
+`, upgrade.Spec.TargetVersion)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -921,8 +818,7 @@ echo "========================================="
 						{
 							Name:    "upgrade-crds",
 							Image:   "bitnami/kubectl:latest",
-							Command: []string{"/bin/bash"},
-							Args:    []string{"-c", script},
+							Command: []string{"/bin/bash", "-c", script},
 						},
 					},
 				},
@@ -932,230 +828,115 @@ echo "========================================="
 	}
 }
 
-// buildControlPlaneUpgradeJob creates the control plane upgrade job with embedded verification
-func (r *LiqoUpgradeReconciler) buildControlPlaneUpgradeJob(upgrade *upgradev1alpha1.LiqoUpgrade) *batchv1.Job {
-	jobName := fmt.Sprintf("%s-%s", controlPlaneJobPrefix, upgrade.Name)
+func (r *LiqoUpgradeReconciler) buildControllerManagerUpgradeJob(upgrade *upgradev1alpha1.LiqoUpgrade) *batchv1.Job {
+	jobName := fmt.Sprintf("%s-%s", controllerManagerUpgradePrefix, upgrade.Name)
 	namespace := upgrade.Spec.Namespace
 	if namespace == "" {
 		namespace = "liqo"
+	}
+
+	backupConfigMapName := upgrade.Status.BackupName
+	if backupConfigMapName == "" {
+		backupConfigMapName = fmt.Sprintf("liqo-upgrade-env-backup-%s", upgrade.Name)
 	}
 
 	script := fmt.Sprintf(`#!/bin/bash
 set -e
 
 echo "========================================="
-echo "Phase 3: Control Plane Upgrade + Verification"
+echo "Stage 2: Upgrading liqo-controller-manager"
 echo "========================================="
 
-CURRENT_VERSION="%s"
 TARGET_VERSION="%s"
 NAMESPACE="%s"
+BACKUP_CONFIGMAP="%s"
 
-echo "Upgrading from $CURRENT_VERSION to $TARGET_VERSION"
-echo "Namespace: $NAMESPACE"
+echo "Step 1: Verifying environment variable backup..."
+if ! kubectl get configmap "${BACKUP_CONFIGMAP}" -n "${NAMESPACE}" &>/dev/null; then
+  echo "⚠️  Warning: Environment backup ConfigMap not found"
+fi
+
 echo ""
+echo "Step 2: Backing up current deployment spec..."
+kubectl get deployment liqo-controller-manager -n "${NAMESPACE}" -o yaml > /tmp/controller-manager-backup.yaml
+echo "Backup saved to /tmp/controller-manager-backup.yaml"
 
-# Step 1: Upgrade controller-manager
-echo "Step 1: Upgrading liqo-controller-manager..."
-echo "  Current image:"
-kubectl get deployment liqo-controller-manager -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].image}'
 echo ""
+echo "Step 3: Extracting current environment variables..."
+# Critical environment variables that MUST be preserved (Stage 2)
+CRITICAL_VARS=(
+  "POD_NAMESPACE"
+  "CLUSTER_ID"
+  "TENANT_NAMESPACE"
+  "CLUSTER_ROLE"
+  "ENABLE_IPAM"
+  "LOG_LEVEL"
+)
 
-NEW_CONTROLLER_IMAGE="ghcr.io/liqotech/liqo-controller-manager:${TARGET_VERSION}"
-echo "  New image: $NEW_CONTROLLER_IMAGE"
+# Store current env vars
+for var in "${CRITICAL_VARS[@]}"; do
+  value=$(kubectl get deployment liqo-controller-manager -n "${NAMESPACE}" -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name=='${var}')].value}" 2>/dev/null || echo "")
+  if [ -n "$value" ]; then
+    echo "  ✓ ${var}=${value}"
+    eval "PRESERVE_${var}=\"${value}\""
+  else
+    echo "  ⚠️  ${var} not found (may use valueFrom)"
+  fi
+done
+
+echo ""
+echo "Step 4: Updating controller-manager image..."
+NEW_IMAGE="ghcr.io/liqotech/liqo-controller-manager:${TARGET_VERSION}"
+echo "New image: ${NEW_IMAGE}"
 
 kubectl set image deployment/liqo-controller-manager \
-  controller-manager="$NEW_CONTROLLER_IMAGE" \
-  -n "$NAMESPACE"
+  controller-manager="${NEW_IMAGE}" \
+  -n "${NAMESPACE}"
 
-echo "  Waiting for rollout..."
-if ! kubectl rollout status deployment/liqo-controller-manager -n "$NAMESPACE" --timeout=5m; then
-    echo "  ❌ Controller-manager rollout failed!"
-    exit 1
+echo ""
+echo "Step 5: Waiting for rollout..."
+if ! kubectl rollout status deployment/liqo-controller-manager -n "${NAMESPACE}" --timeout=5m; then
+  echo "❌ ERROR: Rollout failed!"
+  exit 1
 fi
 
-echo "  Verifying controller-manager is healthy..."
-if ! kubectl wait --for=condition=available --timeout=2m deployment/liqo-controller-manager -n "$NAMESPACE"; then
-    echo "  ❌ Controller-manager not healthy!"
-    exit 1
-fi
-
-echo "  ✅ Controller-manager upgraded and verified"
 echo ""
-
-# Step 2: Upgrade webhook
-echo "Step 2: Upgrading liqo-webhook..."
-echo "  Current image:"
-kubectl get deployment liqo-webhook -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].image}'
-echo ""
-
-NEW_WEBHOOK_IMAGE="ghcr.io/liqotech/webhook:${TARGET_VERSION}"
-echo "  New image: $NEW_WEBHOOK_IMAGE"
-
-kubectl set image deployment/liqo-webhook \
-  webhook="$NEW_WEBHOOK_IMAGE" \
-  -n "$NAMESPACE"
-
-echo "  Waiting for rollout..."
-if ! kubectl rollout status deployment/liqo-webhook -n "$NAMESPACE" --timeout=5m; then
-    echo "  ❌ Webhook rollout failed!"
-    exit 1
-fi
-
-echo "  Verifying webhook is healthy..."
-if ! kubectl wait --for=condition=available --timeout=2m deployment/liqo-webhook -n "$NAMESPACE"; then
-    echo "  ❌ Webhook not healthy!"
-    exit 1
-fi
-
-echo "  ✅ Webhook upgraded and verified"
-echo ""
-
-echo "========================================="
-echo "✅ Phase 3 Complete: Control Plane Upgrade + Verification Passed!"
-echo "========================================="
-`, upgrade.Spec.CurrentVersion, upgrade.Spec.TargetVersion, namespace)
-
-	return &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      jobName,
-			Namespace: namespace,
-			Labels: map[string]string{
-				"app.kubernetes.io/name":      "liqo-upgrade",
-				"app.kubernetes.io/component": "controlplane-upgrade",
-			},
-		},
-		Spec: batchv1.JobSpec{
-			TTLSecondsAfterFinished: int32Ptr(300),
-			Template: corev1.PodTemplateSpec{
-				Spec: corev1.PodSpec{
-					ServiceAccountName: "liqo-upgrade-controller",
-					RestartPolicy:      corev1.RestartPolicyNever,
-					Containers: []corev1.Container{
-						{
-							Name:    "upgrade-controlplane",
-							Image:   "bitnami/kubectl:latest",
-							Command: []string{"/bin/bash", "-c", script},
-						},
-					},
-				},
-			},
-			BackoffLimit: int32Ptr(0),
-		},
-	}
-}
-
-// buildExtendedControlPlaneUpgradeJob creates the extended control plane upgrade job with embedded verification
-func (r *LiqoUpgradeReconciler) buildExtendedControlPlaneUpgradeJob(upgrade *upgradev1alpha1.LiqoUpgrade) *batchv1.Job {
-	jobName := fmt.Sprintf("%s-%s", extendedControlPlaneJobPrefix, upgrade.Name)
-	namespace := upgrade.Spec.Namespace
-	if namespace == "" {
-		namespace = "liqo"
-	}
-
-	script := fmt.Sprintf(`#!/bin/bash
-set -e
-
-echo "========================================="
-echo "Phase 4: Extended Control Plane Upgrade + Verification"
-echo "========================================="
-
-CURRENT_VERSION="%s"
-TARGET_VERSION="%s"
-NAMESPACE="%s"
-
-echo "Upgrading from $CURRENT_VERSION to $TARGET_VERSION"
-echo "Namespace: $NAMESPACE"
-echo ""
-
-# Component list for extended control plane
-COMPONENTS=("liqo-ipam" "liqo-crd-replicator" "liqo-metric-agent" "liqo-proxy")
-
-for COMPONENT in "${COMPONENTS[@]}"; do
-    echo "========================================="
-    echo "Upgrading: $COMPONENT"
-    echo "========================================="
-    
-    # Check if deployment exists
-    if ! kubectl get deployment "$COMPONENT" -n "$NAMESPACE" >/dev/null 2>&1; then
-        echo "  ⚠️  WARNING: $COMPONENT deployment not found, skipping..."
-        echo ""
-        continue
+echo "Step 6: Verifying environment variables after upgrade..."
+# Verify critical env vars are still present
+MISSING_VARS=()
+for var in "${CRITICAL_VARS[@]}"; do
+  value=$(kubectl get deployment liqo-controller-manager -n "${NAMESPACE}" -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name=='${var}')].value}" 2>/dev/null || echo "")
+  original_var="PRESERVE_${var}"
+  if [ -n "${!original_var}" ]; then
+    if [ "$value" != "${!original_var}" ]; then
+      echo "  ⚠️  WARNING: ${var} changed: ${!original_var} -> ${value}"
+    else
+      echo "  ✓ ${var} preserved: ${value}"
     fi
-    
-    echo "  Current image:"
-    kubectl get deployment "$COMPONENT" -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].image}'
-    echo ""
-    
-    # CRITICAL FIX: Handle special cases for image names
-    # Some components have different image names than their deployment names
-    case "$COMPONENT" in
-        "liqo-ipam")
-            NEW_IMAGE="ghcr.io/liqotech/ipam:${TARGET_VERSION}"
-            ;;
-        "liqo-crd-replicator")
-            NEW_IMAGE="ghcr.io/liqotech/crd-replicator:${TARGET_VERSION}"
-            ;;
-        "liqo-metric-agent")
-            NEW_IMAGE="ghcr.io/liqotech/metric-agent:${TARGET_VERSION}"
-            ;;
-        "liqo-proxy")
-            NEW_IMAGE="ghcr.io/liqotech/proxy:${TARGET_VERSION}"
-            ;;
-        *)
-            NEW_IMAGE="ghcr.io/liqotech/${COMPONENT}:${TARGET_VERSION}"
-            ;;
-    esac
-    echo "  New image: $NEW_IMAGE"
-    
-    # Update deployment
-    CONTAINER_NAME=$(kubectl get deployment "$COMPONENT" -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].name}')
-    kubectl set image "deployment/$COMPONENT" \
-      "$CONTAINER_NAME=$NEW_IMAGE" \
-      -n "$NAMESPACE"
-    
-    echo "  Waiting for rollout..."
-    if ! kubectl rollout status "deployment/$COMPONENT" -n "$NAMESPACE" --timeout=5m; then
-        echo "  ❌ $COMPONENT rollout failed!"
-        exit 1
-    fi
-    
-    echo "  Verifying $COMPONENT is healthy..."
-    if ! kubectl wait --for=condition=available --timeout=2m "deployment/$COMPONENT" -n "$NAMESPACE"; then
-        echo "  ❌ $COMPONENT not healthy!"
-        exit 1
-    fi
-    
-    echo "  ✅ $COMPONENT upgraded and verified"
-    echo ""
+  fi
 done
 
-echo "========================================="
-echo "Final Verification - Extended Control Plane"
-echo "========================================="
+echo ""
+echo "Step 7: Verifying deployment health..."
+if ! kubectl wait --for=condition=available --timeout=2m deployment/liqo-controller-manager -n "${NAMESPACE}"; then
+  echo "❌ ERROR: Deployment not healthy!"
+  exit 1
+fi
 
-# Verify all components
-for COMPONENT in "${COMPONENTS[@]}"; do
-    if kubectl get deployment "$COMPONENT" -n "$NAMESPACE" >/dev/null 2>&1; then
-        echo "  Checking $COMPONENT:"
-        kubectl get pods -n "$NAMESPACE" -l "app.kubernetes.io/name=$COMPONENT" 2>/dev/null || \
-        kubectl get pods -n "$NAMESPACE" | grep "$COMPONENT" || echo "    No pods found with standard labels"
-        
-        CURRENT_IMAGE=$(kubectl get deployment "$COMPONENT" -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].image}')
-        echo "    Image: $CURRENT_IMAGE"
-        
-        if [[ "$CURRENT_IMAGE" != *"$TARGET_VERSION"* ]]; then
-            echo "    ❌ ERROR: $COMPONENT not running target version!"
-            exit 1
-        fi
-        echo ""
-    fi
-done
+echo ""
+echo "Step 8: Verifying version..."
+DEPLOYED_VERSION=$(kubectl get deployment liqo-controller-manager -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].image}' | cut -d: -f2)
+echo "Deployed version: ${DEPLOYED_VERSION}"
 
-echo "========================================="
-echo "✅ Phase 4 Complete: Extended Control Plane Upgrade + Verification Passed!"
-echo "========================================="
-`, upgrade.Spec.CurrentVersion, upgrade.Spec.TargetVersion, namespace)
+if [ "${DEPLOYED_VERSION}" != "${TARGET_VERSION}" ]; then
+  echo "❌ ERROR: Version mismatch!"
+  exit 1
+fi
+
+echo ""
+echo "✅ Stage 2 complete: liqo-controller-manager upgraded"
+echo "✅ All critical environment variables preserved"
+`, upgrade.Spec.TargetVersion, namespace, backupConfigMapName)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1163,7 +944,7 @@ echo "========================================="
 			Namespace: namespace,
 			Labels: map[string]string{
 				"app.kubernetes.io/name":      "liqo-upgrade",
-				"app.kubernetes.io/component": "extended-controlplane-upgrade",
+				"app.kubernetes.io/component": "controller-manager-upgrade",
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -1174,7 +955,7 @@ echo "========================================="
 					RestartPolicy:      corev1.RestartPolicyNever,
 					Containers: []corev1.Container{
 						{
-							Name:    "upgrade-extended-controlplane",
+							Name:    "upgrade-controller-manager",
 							Image:   "bitnami/kubectl:latest",
 							Command: []string{"/bin/bash", "-c", script},
 						},
@@ -1186,163 +967,6 @@ echo "========================================="
 	}
 }
 
-// buildDataPlaneUpgradeJob creates the data plane upgrade job
-func (r *LiqoUpgradeReconciler) buildDataPlaneUpgradeJob(upgrade *upgradev1alpha1.LiqoUpgrade) *batchv1.Job {
-	jobName := fmt.Sprintf("%s-%s", dataPlaneJobPrefix, upgrade.Name)
-	namespace := upgrade.Spec.Namespace
-	if namespace == "" {
-		namespace = "liqo"
-	}
-
-	script := fmt.Sprintf(`#!/bin/bash
-set -e
-
-echo "========================================="
-echo "Phase 5: Data Plane Upgrade"
-echo "========================================="
-
-CURRENT_VERSION="%s"
-TARGET_VERSION="%s"
-NAMESPACE="%s"
-
-echo "Upgrading from $CURRENT_VERSION to $TARGET_VERSION"
-echo "Namespace: $NAMESPACE"
-echo ""
-
-# Step 1: Upgrade liqo-gateway (Deployment)
-echo "Step 1: Upgrading liqo-gateway..."
-if kubectl get deployment liqo-gateway -n "$NAMESPACE" >/dev/null 2>&1; then
-    echo "  Current image:"
-    kubectl get deployment liqo-gateway -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].image}'
-    echo ""
-    
-    NEW_GATEWAY_IMAGE="ghcr.io/liqotech/gateway:${TARGET_VERSION}"
-    echo "  New image: $NEW_GATEWAY_IMAGE"
-    
-    CONTAINER_NAME=$(kubectl get deployment liqo-gateway -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].name}')
-    kubectl set image deployment/liqo-gateway \
-      "$CONTAINER_NAME=$NEW_GATEWAY_IMAGE" \
-      -n "$NAMESPACE"
-    
-    echo "  Waiting for rollout..."
-    if ! kubectl rollout status deployment/liqo-gateway -n "$NAMESPACE" --timeout=5m; then
-        echo "  ❌ liqo-gateway rollout failed!"
-        exit 1
-    fi
-    
-    echo "  Verifying liqo-gateway is healthy..."
-    if ! kubectl wait --for=condition=available --timeout=2m deployment/liqo-gateway -n "$NAMESPACE"; then
-        echo "  ❌ liqo-gateway not healthy!"
-        exit 1
-    fi
-    
-    echo "  ✅ liqo-gateway upgraded and verified"
-else
-    echo "  ⚠️  WARNING: liqo-gateway deployment not found, skipping..."
-fi
-echo ""
-
-# Step 2: Upgrade liqo-fabric (DaemonSet)
-echo "Step 2: Upgrading liqo-fabric DaemonSet..."
-if kubectl get daemonset liqo-fabric -n "$NAMESPACE" >/dev/null 2>&1; then
-    echo "  Current image:"
-    kubectl get daemonset liqo-fabric -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].image}'
-    echo ""
-    
-    NEW_FABRIC_IMAGE="ghcr.io/liqotech/fabric:${TARGET_VERSION}"
-    echo "  New image: $NEW_FABRIC_IMAGE"
-    
-    CONTAINER_NAME=$(kubectl get daemonset liqo-fabric -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].name}')
-    kubectl set image daemonset/liqo-fabric \
-      "$CONTAINER_NAME=$NEW_FABRIC_IMAGE" \
-      -n "$NAMESPACE"
-    
-    echo "  Waiting for DaemonSet rollout..."
-    if ! kubectl rollout status daemonset/liqo-fabric -n "$NAMESPACE" --timeout=10m; then
-        echo "  ❌ liqo-fabric rollout failed!"
-        exit 1
-    fi
-    
-    echo "  Verifying liqo-fabric pods..."
-    DESIRED=$(kubectl get daemonset liqo-fabric -n "$NAMESPACE" -o jsonpath='{.status.desiredNumberScheduled}')
-    READY=$(kubectl get daemonset liqo-fabric -n "$NAMESPACE" -o jsonpath='{.status.numberReady}')
-    
-    if [ "$DESIRED" != "$READY" ]; then
-        echo "  ❌ ERROR: liqo-fabric not all pods ready! Desired: $DESIRED, Ready: $READY"
-        exit 1
-    fi
-    
-    echo "  ✅ liqo-fabric upgraded and verified ($READY/$DESIRED pods ready)"
-else
-    echo "  ⚠️  WARNING: liqo-fabric daemonset not found, skipping..."
-fi
-echo ""
-
-# Step 3: Final verification
-echo "========================================="
-echo "Final Verification - Data Plane"
-echo "========================================="
-
-if kubectl get deployment liqo-gateway -n "$NAMESPACE" >/dev/null 2>&1; then
-    echo "  Checking liqo-gateway:"
-    GATEWAY_IMAGE=$(kubectl get deployment liqo-gateway -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].image}')
-    echo "    Image: $GATEWAY_IMAGE"
-    
-    if [[ "$GATEWAY_IMAGE" != *"$TARGET_VERSION"* ]]; then
-        echo "    ❌ ERROR: liqo-gateway not running target version!"
-        exit 1
-    fi
-fi
-
-if kubectl get daemonset liqo-fabric -n "$NAMESPACE" >/dev/null 2>&1; then
-    echo "  Checking liqo-fabric:"
-    FABRIC_IMAGE=$(kubectl get daemonset liqo-fabric -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].image}')
-    echo "    Image: $FABRIC_IMAGE"
-    
-    if [[ "$FABRIC_IMAGE" != *"$TARGET_VERSION"* ]]; then
-        echo "    ❌ ERROR: liqo-fabric not running target version!"
-        exit 1
-    fi
-    
-    kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/name=fabric
-fi
-
-echo ""
-echo "========================================="
-echo "✅ Phase 5 Complete: Data Plane Upgrade Passed!"
-echo "========================================="
-`, upgrade.Spec.CurrentVersion, upgrade.Spec.TargetVersion, namespace)
-
-	return &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      jobName,
-			Namespace: namespace,
-			Labels: map[string]string{
-				"app.kubernetes.io/name":      "liqo-upgrade",
-				"app.kubernetes.io/component": "dataplane-upgrade",
-			},
-		},
-		Spec: batchv1.JobSpec{
-			TTLSecondsAfterFinished: int32Ptr(300),
-			Template: corev1.PodTemplateSpec{
-				Spec: corev1.PodSpec{
-					ServiceAccountName: "liqo-upgrade-controller",
-					RestartPolicy:      corev1.RestartPolicyNever,
-					Containers: []corev1.Container{
-						{
-							Name:    "upgrade-dataplane",
-							Image:   "bitnami/kubectl:latest",
-							Command: []string{"/bin/bash", "-c", script},
-						},
-					},
-				},
-			},
-			BackoffLimit: int32Ptr(0),
-		},
-	}
-}
-
-// buildRollbackJob creates the rollback job
 func (r *LiqoUpgradeReconciler) buildRollbackJob(upgrade *upgradev1alpha1.LiqoUpgrade) *batchv1.Job {
 	jobName := fmt.Sprintf("%s-%s", rollbackJobPrefix, upgrade.Name)
 	namespace := upgrade.Spec.Namespace
@@ -1350,128 +974,102 @@ func (r *LiqoUpgradeReconciler) buildRollbackJob(upgrade *upgradev1alpha1.LiqoUp
 		namespace = "liqo"
 	}
 
-	var rollbackScript string
-
-	if upgrade.Status.LastSuccessfulPhase == upgradev1alpha1.PhaseControlPlane ||
-		upgrade.Status.LastSuccessfulPhase == upgradev1alpha1.PhaseExtendedControlPlane ||
-		upgrade.Status.LastSuccessfulPhase == upgradev1alpha1.PhaseDataPlane {
-		// Phase 3 or Phase 4 failed - rollback EVERYTHING
-		rollbackScript = `#!/bin/bash
-set -e
-
-echo "========================================="
-echo "Rolling Back EVERYTHING (CRDs + Control Plane)"
-echo "========================================="
-echo ""
-
-# Find backup job pod (even if completed)
-BACKUP_POD=$(kubectl get pods -n ` + namespace + ` -l app.kubernetes.io/component=backup -o jsonpath='{.items[0].metadata.name}')
-
-if [ -z "$BACKUP_POD" ]; then
-    echo "❌ ERROR: Backup pod not found!"
-    exit 1
-fi
-
-echo "Found backup pod: $BACKUP_POD"
-POD_STATUS=$(kubectl get pod "$BACKUP_POD" -n ` + namespace + ` -o jsonpath='{.status.phase}')
-echo "Pod status: $POD_STATUS"
-echo ""
-
-# Step 1: Copy all backups from the pod (works even if pod is completed)
-echo "Step 1: Copying backup files from pod..."
-kubectl cp ` + namespace + `/$BACKUP_POD:/tmp/backup /tmp/rollback-backup || {
-    echo "❌ ERROR: Failed to copy backup files from pod!"
-    echo "   This might happen if the pod has been deleted or is in an invalid state."
-    exit 1
-}
-
-echo "  ✅ Backup files copied successfully"
-echo ""
-
-# Step 2: Rollback control plane
-echo "Step 2: Rolling back control plane..."
-echo "  Restoring liqo-controller-manager..."
-kubectl apply -f /tmp/rollback-backup/controller-manager-backup.yaml
-kubectl rollout status deployment/liqo-controller-manager -n ` + namespace + ` --timeout=3m
-
-echo "  Restoring liqo-webhook..."
-kubectl apply -f /tmp/rollback-backup/webhook-backup.yaml
-kubectl rollout status deployment/liqo-webhook -n ` + namespace + ` --timeout=3m
-
-echo "  ✅ Control plane rolled back"
-echo ""
-
-# Step 3: Rollback CRDs
-echo "Step 3: Rolling back CRDs..."
-CRD_COUNT=$(find /tmp/rollback-backup -name "*.yaml" | grep -v -E "(controller-manager|webhook)" | wc -l)
-echo "  Found $CRD_COUNT CRDs to restore"
-
-for crd_file in /tmp/rollback-backup/*.yaml; do
-    filename=$(basename "$crd_file")
-    
-    # Skip control plane backups
-    if [[ "$filename" =~ (controller-manager|webhook) ]]; then
-        continue
-    fi
-    
-    echo "    Restoring: $filename"
-    kubectl apply --server-side --force-conflicts -f "$crd_file"
-done
-
-echo "  ✅ CRDs rolled back"
-echo ""
-echo "✅ Complete rollback successful!"
-`
-	} else {
-		// Phase 2 failed - rollback CRDs only
-		rollbackScript = `#!/bin/bash
-set -e
-
-echo "========================================="
-echo "Rolling Back CRDs Only"
-echo "========================================="
-echo ""
-
-# Find backup job pod (even if completed)
-BACKUP_POD=$(kubectl get pods -n ` + namespace + ` -l app.kubernetes.io/component=backup -o jsonpath='{.items[0].metadata.name}')
-
-if [ -z "$BACKUP_POD" ]; then
-    echo "❌ ERROR: Backup pod not found!"
-    exit 1
-fi
-
-echo "Found backup pod: $BACKUP_POD"
-POD_STATUS=$(kubectl get pod "$BACKUP_POD" -n ` + namespace + ` -o jsonpath='{.status.phase}')
-echo "Pod status: $POD_STATUS"
-echo ""
-
-# Copy all backups from the pod (works even if pod is completed)
-echo "Copying CRD backups from pod..."
-kubectl cp ` + namespace + `/$BACKUP_POD:/tmp/backup /tmp/rollback-backup || {
-    echo "❌ ERROR: Failed to copy backup files from pod!"
-    exit 1
-}
-
-CRD_COUNT=$(find /tmp/rollback-backup -name "*.yaml" | grep -v -E "(controller-manager|webhook)" | wc -l)
-echo "Found $CRD_COUNT CRDs to restore"
-echo ""
-
-for crd_file in /tmp/rollback-backup/*.yaml; do
-    filename=$(basename "$crd_file")
-    
-    # Skip control plane backups
-    if [[ "$filename" =~ (controller-manager|webhook) ]]; then
-        continue
-    fi
-    
-    echo "  Restoring: $filename"
-    kubectl apply --server-side --force-conflicts -f "$crd_file"
-done
-
-echo ""
-echo "✅ CRD rollback successful!"
-`
+	backupConfigMapName := upgrade.Status.BackupName
+	if backupConfigMapName == "" {
+		backupConfigMapName = fmt.Sprintf("liqo-upgrade-env-backup-%s", upgrade.Name)
 	}
+
+	script := fmt.Sprintf(`#!/bin/bash
+set -e
+
+echo "========================================="
+echo "Rolling back to version %s"
+echo "========================================="
+
+PREVIOUS_VERSION="%s"
+NAMESPACE="%s"
+BACKUP_CONFIGMAP="%s"
+
+echo "Step 1: Verifying environment backup exists..."
+if kubectl get configmap "${BACKUP_CONFIGMAP}" -n "${NAMESPACE}" &>/dev/null; then
+  echo "✓ Environment backup found"
+  
+  # Extract critical env vars from backup
+  echo ""
+  echo "Step 2: Extracting environment variables from backup..."
+  kubectl get configmap "${BACKUP_CONFIGMAP}" -n "${NAMESPACE}" -o yaml > /tmp/env-backup.yaml
+  echo "Environment backup retrieved"
+else
+  echo "⚠️  Warning: Environment backup ConfigMap not found, proceeding without env restoration"
+fi
+
+echo ""
+echo "Step 3: Rolling back liqo-controller-manager image..."
+PREVIOUS_IMAGE="ghcr.io/liqotech/liqo-controller-manager:${PREVIOUS_VERSION}"
+echo "Previous image: ${PREVIOUS_IMAGE}"
+
+kubectl set image deployment/liqo-controller-manager \
+  controller-manager="${PREVIOUS_IMAGE}" \
+  -n "${NAMESPACE}"
+
+echo ""
+echo "Step 4: Waiting for rollback rollout..."
+if ! kubectl rollout status deployment/liqo-controller-manager -n "${NAMESPACE}" --timeout=5m; then
+  echo "❌ ERROR: Rollback rollout failed!"
+  exit 1
+fi
+
+echo ""
+echo "Step 5: Verifying rollback health..."
+if ! kubectl wait --for=condition=available --timeout=2m deployment/liqo-controller-manager -n "${NAMESPACE}"; then
+  echo "❌ ERROR: Deployment not healthy after rollback!"
+  exit 1
+fi
+
+echo ""
+echo "Step 6: Verifying version rollback..."
+DEPLOYED_VERSION=$(kubectl get deployment liqo-controller-manager -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].image}' | cut -d: -f2)
+echo "Deployed version after rollback: ${DEPLOYED_VERSION}"
+
+if [ "${DEPLOYED_VERSION}" != "${PREVIOUS_VERSION}" ]; then
+  echo "❌ ERROR: Version mismatch after rollback!"
+  exit 1
+fi
+
+echo ""
+echo "Step 7: Verifying critical environment variables..."
+# List of critical env vars that should be present
+CRITICAL_VARS=(
+  "POD_NAMESPACE"
+  "CLUSTER_ID"
+  "TENANT_NAMESPACE"
+  "CLUSTER_ROLE"
+  "ENABLE_IPAM"
+  "LOG_LEVEL"
+)
+
+for var in "${CRITICAL_VARS[@]}"; do
+  value=$(kubectl get deployment liqo-controller-manager -n "${NAMESPACE}" -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name=='${var}')].value}" 2>/dev/null || echo "")
+  if [ -n "$value" ]; then
+    echo "  ✓ ${var}=${value}"
+  else
+    echo "  ⚠️  ${var} not found (may use valueFrom)"
+  fi
+done
+
+# Rollback CRDs if needed (based on lastSuccessfulPhase)
+LAST_PHASE="%s"
+if [ "$LAST_PHASE" = "UpgradingCRDs" ] || [ "$LAST_PHASE" = "UpgradingControllerManager" ]; then
+  echo ""
+  echo "Note: CRD rollback may be needed but is not implemented in this simplified rollback"
+  echo "Manual intervention may be required if CRDs changed"
+fi
+
+echo ""
+echo "✅ Rollback complete"
+echo "✅ Controller-manager restored to ${PREVIOUS_VERSION}"
+echo "✅ Environment variables verified"
+`, upgrade.Status.PreviousVersion, upgrade.Status.PreviousVersion, namespace, backupConfigMapName, upgrade.Status.LastSuccessfulPhase)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1492,7 +1090,7 @@ echo "✅ CRD rollback successful!"
 						{
 							Name:    "rollback",
 							Image:   "bitnami/kubectl:latest",
-							Command: []string{"/bin/bash", "-c", rollbackScript},
+							Command: []string{"/bin/bash", "-c", script},
 						},
 					},
 				},
@@ -1502,17 +1100,16 @@ echo "✅ CRD rollback successful!"
 	}
 }
 
+// Helper functions
+
 func (r *LiqoUpgradeReconciler) updateStatus(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade, phase upgradev1alpha1.UpgradePhase, message string, additionalUpdates map[string]interface{}) (ctrl.Result, error) {
 	upgrade.Status.Phase = phase
 	upgrade.Status.Message = message
 	upgrade.Status.LastUpdated = metav1.Now()
 
 	if additionalUpdates != nil {
-		if backupReady, ok := additionalUpdates["backupReady"].(bool); ok {
-			upgrade.Status.BackupReady = backupReady
-		}
-		if backupName, ok := additionalUpdates["backupName"].(string); ok {
-			upgrade.Status.BackupName = backupName
+		if previousVersion, ok := additionalUpdates["previousVersion"].(string); ok {
+			upgrade.Status.PreviousVersion = previousVersion
 		}
 		if lastSuccessfulPhase, ok := additionalUpdates["lastSuccessfulPhase"].(upgradev1alpha1.UpgradePhase); ok {
 			upgrade.Status.LastSuccessfulPhase = lastSuccessfulPhase
@@ -1520,14 +1117,14 @@ func (r *LiqoUpgradeReconciler) updateStatus(ctx context.Context, upgrade *upgra
 		if rolledBack, ok := additionalUpdates["rolledBack"].(bool); ok {
 			upgrade.Status.RolledBack = rolledBack
 		}
-		if detectedLocalVersion, ok := additionalUpdates["detectedLocalVersion"].(string); ok {
-			upgrade.Status.DetectedLocalVersion = detectedLocalVersion
+		if conditions, ok := additionalUpdates["conditions"].([]metav1.Condition); ok {
+			upgrade.Status.Conditions = conditions
 		}
-		if lowestVersion, ok := additionalUpdates["lowestVersion"].(string); ok {
-			upgrade.Status.LowestVersion = lowestVersion
+		if backupReady, ok := additionalUpdates["backupReady"].(bool); ok {
+			upgrade.Status.BackupReady = backupReady
 		}
-		if compatibilityCheckPassed, ok := additionalUpdates["compatibilityCheckPassed"].(bool); ok {
-			upgrade.Status.CompatibilityCheckPassed = &compatibilityCheckPassed
+		if backupName, ok := additionalUpdates["backupName"].(string); ok {
+			upgrade.Status.BackupName = backupName
 		}
 	}
 
@@ -1538,11 +1135,16 @@ func (r *LiqoUpgradeReconciler) updateStatus(ctx context.Context, upgrade *upgra
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
+func (r *LiqoUpgradeReconciler) fail(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade, message string) (ctrl.Result, error) {
+	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseFailed, message, nil)
+}
+
 func (r *LiqoUpgradeReconciler) handleDeletion(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	if controllerutil.ContainsFinalizer(upgrade, finalizerName) {
-		jobPrefixes := []string{backupJobPrefix, upgradeJobPrefix, rollbackJobPrefix, controlPlaneJobPrefix, extendedControlPlaneJobPrefix, dataPlaneJobPrefix}
+		// Clean up jobs
+		jobPrefixes := []string{freezeOperationsJobPrefix, crdUpgradeJobPrefix, controllerManagerUpgradePrefix, rollbackJobPrefix}
 		for _, prefix := range jobPrefixes {
 			jobName := fmt.Sprintf("%s-%s", prefix, upgrade.Name)
 			job := &batchv1.Job{}

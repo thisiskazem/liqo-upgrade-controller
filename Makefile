@@ -238,3 +238,20 @@ mv $(1) $(1)-$(3) ;\
 } ;\
 ln -sf $$(realpath $(1)-$(3)) $(1)
 endef
+
+
+.PHONY: deploy-upgrade
+deploy-upgrade: manifests kustomize ## Deploy upgrade controller and RBAC
+	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
+	$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -
+	$(KUBECTL) apply -f config/rbac/upgrade-rbac.yaml
+	$(KUBECTL) apply -f config/default/compatibility-configmap.yaml
+
+.PHONY: test-upgrade
+test-upgrade: ## Apply test upgrade CR
+	$(KUBECTL) apply -f examples/test-upgrade.yaml
+
+.PHONY: cleanup-upgrade
+cleanup-upgrade: ## Clean up upgrade resources
+	$(KUBECTL) delete -f examples/test-upgrade.yaml --ignore-not-found
+	$(KUBECTL) delete jobs -n liqo -l app.kubernetes.io/name=liqo-upgrade --ignore-not-found

@@ -7,45 +7,66 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: liqo-upgrade-job-role
+  name: liqo-upgrade-role
 rules:
 # CRD permissions
 - apiGroups: ["apiextensions.k8s.io"]
   resources: ["customresourcedefinitions"]
   verbs: ["get", "list", "watch", "create", "update", "patch"]
-# Deployment permissions - MUST include watch for rollout status
+
+# Deployment permissions
 - apiGroups: ["apps"]
   resources: ["deployments"]
   verbs: ["get", "list", "watch", "patch", "update"]
-# Pod permissions
-- apiGroups: [""]
-  resources: ["pods", "pods/log"]
-  verbs: ["get", "list"]
+
+# Deployment status (for rollout status)
+- apiGroups: ["apps"]
+  resources: ["deployments/status"]
+  verbs: ["get", "watch"]
+
 # ReplicaSet permissions (needed for rollout status)
 - apiGroups: ["apps"]
   resources: ["replicasets"]
   verbs: ["get", "list", "watch"]
+
+# Pod permissions
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch"]
+
+# ConfigMap permissions (for compatibility matrix)
 - apiGroups: [""]
   resources: ["configmaps"]
-  verbs: ["get", "list"]
-- apiGroups: ["apps"]
-  resources: ["deployments"]
-  verbs: ["get", "list", "watch", "patch", "update"]
+  verbs: ["get", "list", "watch"]
+
+# Job permissions
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["get", "list", "watch", "create", "delete", "patch", "update"]
+
+# Liqo resources (for freeze operations)
+- apiGroups: ["core.liqo.io"]
+  resources: ["foreignclusters"]
+  verbs: ["get", "list", "watch"]
+
+- apiGroups: ["offloading.liqo.io"]
+  resources: ["namespaceoffloadings"]
+  verbs: ["get", "list", "watch"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: liqo-upgrade-job-binding
+  name: liqo-upgrade-binding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: liqo-upgrade-job-role
+  name: liqo-upgrade-role
 subjects:
 - kind: ServiceAccount
   name: liqo-upgrade-controller
   namespace: liqo
-# Also bind the controller manager ServiceAccount so it can watch cluster-scoped Deployments
+# Also bind the controller manager ServiceAccount
 - kind: ServiceAccount
   name: liqo-upgrade-controller-controller-manager
   namespace: liqo-upgrade-controller-system

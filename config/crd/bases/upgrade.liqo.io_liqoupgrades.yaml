@@ -24,6 +24,9 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
+    - jsonPath: .status.currentStage
+      name: Stage
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -50,8 +53,12 @@ spec:
             type: object
           spec:
             properties:
+              autoRollback:
+                type: boolean
               currentVersion:
                 type: string
+              dryRun:
+                type: boolean
               namespace:
                 type: string
               remoteClusterVersions:
@@ -66,6 +73,8 @@ spec:
                   - version
                   type: object
                 type: array
+              strategy:
+                type: string
               targetVersion:
                 type: string
             required:
@@ -77,8 +86,6 @@ spec:
               backupName:
                 type: string
               backupReady:
-                type: boolean
-              compatibilityCheckPassed:
                 type: boolean
               conditions:
                 items:
@@ -136,21 +143,23 @@ spec:
                   - type
                   type: object
                 type: array
-              detectedLocalVersion:
-                type: string
+              currentStage:
+                type: integer
               lastSuccessfulPhase:
                 type: string
               lastUpdated:
                 format: date-time
                 type: string
-              lowestVersion:
-                type: string
               message:
                 type: string
               phase:
                 type: string
+              previousVersion:
+                type: string
               rolledBack:
                 type: boolean
+              totalStages:
+                type: integer
             type: object
         required:
         - spec

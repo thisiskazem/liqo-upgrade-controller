@@ -25,40 +25,58 @@ type RemoteClusterVersion struct {
 	Version   string `json:"version"`
 }
 
+type UpgradeStrategy string
+
+const (
+	StrategySequential UpgradeStrategy = "Sequential"
+	StrategyParallel   UpgradeStrategy = "Parallel"
+)
+
 type LiqoUpgradeSpec struct {
 	CurrentVersion        string                 `json:"currentVersion"`
 	TargetVersion         string                 `json:"targetVersion"`
 	Namespace             string                 `json:"namespace,omitempty"`
 	RemoteClusterVersions []RemoteClusterVersion `json:"remoteClusterVersions,omitempty"`
+	AutoRollback          *bool                  `json:"autoRollback,omitempty"`
+	Strategy              *UpgradeStrategy       `json:"strategy,omitempty"`
+	DryRun                bool                   `json:"dryRun,omitempty"`
 }
 
 type UpgradePhase string
 
 const (
-	PhaseNone                 UpgradePhase = ""
-	PhaseCompatibilityCheck   UpgradePhase = "CheckingCompatibility"
-	PhaseBackup               UpgradePhase = "CreatingBackup"
-	PhaseCRDs                 UpgradePhase = "UpgradingCRDs"
-	PhaseControlPlane         UpgradePhase = "UpgradingControlPlane"
-	PhaseExtendedControlPlane UpgradePhase = "UpgradingExtendedControlPlane"
-	PhaseDataPlane            UpgradePhase = "UpgradingDataPlane"
-	PhaseRollingBack          UpgradePhase = "RollingBack"
-	PhaseCompleted            UpgradePhase = "Completed"
-	PhaseFailed               UpgradePhase = "Failed"
+	PhaseNone               UpgradePhase = ""
+	PhasePending            UpgradePhase = "Pending"
+	PhaseValidating         UpgradePhase = "Validating"
+	PhaseFreezingOperations UpgradePhase = "FreezingOperations"
+	PhaseCRDs               UpgradePhase = "UpgradingCRDs"
+	PhaseControllerManager  UpgradePhase = "UpgradingControllerManager"
+	PhaseVerifying          UpgradePhase = "Verifying"
+	PhaseRollingBack        UpgradePhase = "RollingBack"
+	PhaseCompleted          UpgradePhase = "Completed"
+	PhaseFailed             UpgradePhase = "Failed"
+)
+
+type ConditionType string
+
+const (
+	ConditionCompatible       ConditionType = "Compatible"
+	ConditionHealthy          ConditionType = "Healthy"
+	ConditionRollbackRequired ConditionType = "RollbackRequired"
 )
 
 type LiqoUpgradeStatus struct {
-	Phase                    UpgradePhase       `json:"phase,omitempty"`
-	Message                  string             `json:"message,omitempty"`
-	LastUpdated              metav1.Time        `json:"lastUpdated,omitempty"`
-	BackupName               string             `json:"backupName,omitempty"`
-	BackupReady              bool               `json:"backupReady,omitempty"`
-	LastSuccessfulPhase      UpgradePhase       `json:"lastSuccessfulPhase,omitempty"`
-	RolledBack               bool               `json:"rolledBack,omitempty"`
-	DetectedLocalVersion     string             `json:"detectedLocalVersion,omitempty"`
-	LowestVersion            string             `json:"lowestVersion,omitempty"`
-	CompatibilityCheckPassed *bool              `json:"compatibilityCheckPassed,omitempty"`
-	Conditions               []metav1.Condition `json:"conditions,omitempty"`
+	Phase               UpgradePhase       `json:"phase,omitempty"`
+	Message             string             `json:"message,omitempty"`
+	LastUpdated         metav1.Time        `json:"lastUpdated,omitempty"`
+	PreviousVersion     string             `json:"previousVersion,omitempty"`
+	BackupName          string             `json:"backupName,omitempty"`
+	BackupReady         bool               `json:"backupReady,omitempty"`
+	LastSuccessfulPhase UpgradePhase       `json:"lastSuccessfulPhase,omitempty"`
+	CurrentStage        int                `json:"currentStage,omitempty"`
+	TotalStages         int                `json:"totalStages,omitempty"`
+	RolledBack          bool               `json:"rolledBack,omitempty"`
+	Conditions          []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -66,6 +84,7 @@ type LiqoUpgradeStatus struct {
 // +kubebuilder:printcolumn:name="Current",type=string,JSONPath=`.spec.currentVersion`
 // +kubebuilder:printcolumn:name="Target",type=string,JSONPath=`.spec.targetVersion`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Stage",type=string,JSONPath=`.status.currentStage`
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 type LiqoUpgrade struct {
