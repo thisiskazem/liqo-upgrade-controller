@@ -318,8 +318,9 @@ labels:
    - Deployment YAMLs saved in job pod
 
 2. **Version Validation**
-   - Verifies currentVersion matches cluster
-   - Fails fast on mismatch
+   - Auto-detects local cluster version from liqo-controller-manager
+   - Retrieves remote cluster versions from ForeignCluster CRs
+   - Validates minimum version compatibility with target version
 
 3. **Smart Comparison**
    - SHA256 hash comparison

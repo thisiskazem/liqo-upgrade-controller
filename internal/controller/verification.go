@@ -76,6 +76,6 @@ func (r *LiqoUpgradeReconciler) performVerification(ctx context.Context, upgrade
 	}
 
 	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseCompleted,
-		fmt.Sprintf("Upgrade completed successfully: %s → %s", upgrade.Spec.CurrentVersion, upgrade.Spec.TargetVersion),
+		fmt.Sprintf("Upgrade completed successfully: %s → %s", upgrade.Status.PreviousVersion, upgrade.Spec.TargetVersion),
 		statusUpdates)
 }

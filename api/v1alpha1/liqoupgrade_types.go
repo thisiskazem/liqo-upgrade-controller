@@ -20,11 +20,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-type RemoteClusterVersion struct {
-	ClusterID string `json:"clusterID"`
-	Version   string `json:"version"`
-}
-
 type UpgradeStrategy string
 
 const (
@@ -33,13 +28,11 @@ const (
 )
 
 type LiqoUpgradeSpec struct {
-	CurrentVersion        string                 `json:"currentVersion"`
-	TargetVersion         string                 `json:"targetVersion"`
-	Namespace             string                 `json:"namespace,omitempty"`
-	RemoteClusterVersions []RemoteClusterVersion `json:"remoteClusterVersions,omitempty"`
-	AutoRollback          *bool                  `json:"autoRollback,omitempty"`
-	Strategy              *UpgradeStrategy       `json:"strategy,omitempty"`
-	DryRun                bool                   `json:"dryRun,omitempty"`
+	TargetVersion string           `json:"targetVersion"`
+	Namespace     string           `json:"namespace,omitempty"`
+	AutoRollback  *bool            `json:"autoRollback,omitempty"`
+	Strategy      *UpgradeStrategy `json:"strategy,omitempty"`
+	DryRun        bool             `json:"dryRun,omitempty"`
 }
 
 type UpgradePhase string
@@ -82,7 +75,6 @@ type LiqoUpgradeStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:printcolumn:name="Current",type=string,JSONPath=`.spec.currentVersion`
 // +kubebuilder:printcolumn:name="Target",type=string,JSONPath=`.spec.targetVersion`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Stage",type=string,JSONPath=`.status.currentStage`

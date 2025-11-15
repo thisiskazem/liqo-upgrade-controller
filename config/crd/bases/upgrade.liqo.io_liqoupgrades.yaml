@@ -15,9 +15,6 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.currentVersion
-      name: Current
-      type: string
     - jsonPath: .spec.targetVersion
       name: Target
       type: string
@@ -55,30 +52,15 @@ spec:
             properties:
               autoRollback:
                 type: boolean
-              currentVersion:
-                type: string
               dryRun:
                 type: boolean
               namespace:
                 type: string
-              remoteClusterVersions:
-                items:
-                  properties:
-                    clusterID:
-                      type: string
-                    version:
-                      type: string
-                  required:
-                  - clusterID
-                  - version
-                  type: object
-                type: array
               strategy:
                 type: string
               targetVersion:
                 type: string
             required:
-            - currentVersion
             - targetVersion
             type: object
           status:

@@ -24,6 +24,8 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -64,41 +66,53 @@ func (r *LiqoUpgradeReconciler) performValidation(ctx context.Context, upgrade *
 		return r.fail(ctx, upgrade, fmt.Sprintf("Cluster identity verification failed: %v", err))
 	}
 
-	// Step 2: Check compatibility matrix
-	logger.Info("Step 2: Checking compatibility matrix")
+	// Step 2: Detect local cluster version from liqo-controller-manager image
+	logger.Info("Step 2: Detecting local cluster Liqo version")
+	localVersion, err := r.detectDeployedVersion(ctx, namespace)
+	if err != nil {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to detect local cluster version: %v", err))
+	}
+	logger.Info("Local cluster version detected", "version", localVersion)
+
+	// Step 3: Get remote cluster versions from ForeignCluster CRs
+	logger.Info("Step 3: Getting remote cluster versions from ForeignCluster CRs")
+	remoteVersions, err := r.getRemoteClusterVersions(ctx, localVersion)
+	if err != nil {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to get remote cluster versions: %v", err))
+	}
+
+	// Step 4: Find minimum version among all versions (local + remotes)
+	logger.Info("Step 4: Finding minimum version among all clusters")
+	allVersions := append([]string{localVersion}, remoteVersions...)
+	minimumVersion := r.findMinimumVersion(allVersions)
+	logger.Info("Minimum version across all clusters", "version", minimumVersion)
+
+	// Step 5: Load compatibility matrix and check if minimum version can upgrade to target
+	logger.Info("Step 5: Checking compatibility matrix")
 	matrix, err := r.loadCompatibilityMatrix(ctx, namespace)
 	if err != nil {
-		logger.Info("Compatibility matrix not found, proceeding without check", "error", err.Error())
-	} else {
-		if !r.isCompatible(matrix, upgrade.Spec.CurrentVersion, upgrade.Spec.TargetVersion) {
-			return r.fail(ctx, upgrade, fmt.Sprintf("Incompatible versions: %s → %s", upgrade.Spec.CurrentVersion, upgrade.Spec.TargetVersion))
-		}
+		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to load compatibility matrix: %v", err))
 	}
 
-	// Step 3: Verify current version matches deployment
-	logger.Info("Step 3: Verifying current version")
-	deployedVersion, err := r.detectDeployedVersion(ctx, namespace)
-	if err != nil {
-		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to detect deployed version: %v", err))
+	if !r.isCompatible(matrix, minimumVersion, upgrade.Spec.TargetVersion) {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Incompatible upgrade: minimum version %s cannot upgrade to %s", minimumVersion, upgrade.Spec.TargetVersion))
 	}
-	if deployedVersion != upgrade.Spec.CurrentVersion {
-		return r.fail(ctx, upgrade, fmt.Sprintf("Version mismatch: deployed=%s, expected=%s", deployedVersion, upgrade.Spec.CurrentVersion))
-	}
+	logger.Info("Compatibility check passed", "from", minimumVersion, "to", upgrade.Spec.TargetVersion)
 
-	// Step 4: Backup critical environment variables and flags
-	logger.Info("Step 4: Backing up environment variables and configuration")
+	// Step 6: Backup critical environment variables and flags
+	logger.Info("Step 6: Backing up environment variables and configuration")
 	if err := r.backupEnvironmentConfig(ctx, upgrade, namespace); err != nil {
 		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to backup environment config: %v", err))
 	}
 
-	// Step 5: Check component health
-	logger.Info("Step 5: Checking component health")
+	// Step 7: Check component health
+	logger.Info("Step 7: Checking component health")
 	if err := r.verifyComponentHealth(ctx, namespace); err != nil {
 		return r.fail(ctx, upgrade, fmt.Sprintf("Component health check failed: %v", err))
 	}
 
-	// Step 6: Save previous version
-	upgrade.Status.PreviousVersion = upgrade.Spec.CurrentVersion
+	// Step 8: Save previous version (local version)
+	upgrade.Status.PreviousVersion = localVersion
 
 	// Add Compatible condition
 	condition := metav1.Condition{
@@ -106,11 +120,11 @@ func (r *LiqoUpgradeReconciler) performValidation(ctx context.Context, upgrade *
 		Status:             metav1.ConditionTrue,
 		LastTransitionTime: metav1.Now(),
 		Reason:             "ValidationPassed",
-		Message:            fmt.Sprintf("Version %s → %s is compatible", upgrade.Spec.CurrentVersion, upgrade.Spec.TargetVersion),
+		Message:            fmt.Sprintf("Minimum version %s → %s is compatible", minimumVersion, upgrade.Spec.TargetVersion),
 	}
 
 	statusUpdates := map[string]interface{}{
-		"previousVersion": upgrade.Spec.CurrentVersion,
+		"previousVersion": localVersion,
 		"conditions":      []metav1.Condition{condition},
 		"backupReady":     upgrade.Status.BackupReady,
 		"backupName":      upgrade.Status.BackupName,
@@ -323,4 +337,104 @@ func (r *LiqoUpgradeReconciler) isCompatible(matrix CompatibilityMatrix, sourceV
 		}
 	}
 	return false
+}
+
+// getRemoteClusterVersions retrieves version information from all ForeignCluster CRs
+func (r *LiqoUpgradeReconciler) getRemoteClusterVersions(ctx context.Context, localVersion string) ([]string, error) {
+	logger := log.FromContext(ctx)
+
+	// List all ForeignCluster resources
+	foreignClusterList := &unstructured.UnstructuredList{}
+	foreignClusterList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "core.liqo.io",
+		Version: "v1beta1",
+		Kind:    "ForeignCluster",
+	})
+
+	if err := r.List(ctx, foreignClusterList); err != nil {
+		return nil, fmt.Errorf("failed to list ForeignCluster resources: %w", err)
+	}
+
+	logger.Info("Found ForeignCluster resources", "count", len(foreignClusterList.Items))
+
+	var remoteVersions []string
+	for _, fc := range foreignClusterList.Items {
+		clusterID := fc.GetName()
+
+		// Extract status.remoteVersion if it exists
+		remoteVersion, found, err := unstructured.NestedString(fc.Object, "status", "remoteVersion")
+		if err != nil {
+			logger.Info("Warning: failed to extract remoteVersion from ForeignCluster", "clusterID", clusterID, "error", err.Error())
+			// If error accessing field, use local version as default
+			remoteVersions = append(remoteVersions, localVersion)
+			continue
+		}
+
+		if !found || remoteVersion == "" {
+			// status.remoteVersion doesn't exist or is empty, use local version as default
+			logger.Info("ForeignCluster has no remoteVersion, using local version", "clusterID", clusterID, "defaultVersion", localVersion)
+			remoteVersions = append(remoteVersions, localVersion)
+		} else {
+			logger.Info("ForeignCluster version", "clusterID", clusterID, "version", remoteVersion)
+			remoteVersions = append(remoteVersions, remoteVersion)
+		}
+	}
+
+	return remoteVersions, nil
+}
+
+// findMinimumVersion finds the minimum version from a list of versions
+func (r *LiqoUpgradeReconciler) findMinimumVersion(versions []string) string {
+	if len(versions) == 0 {
+		return ""
+	}
+
+	// Start with the first version as minimum
+	minVersion := versions[0]
+
+	// Compare with all other versions
+	for _, version := range versions[1:] {
+		if r.compareVersions(version, minVersion) < 0 {
+			minVersion = version
+		}
+	}
+
+	return minVersion
+}
+
+// compareVersions compares two version strings
+// Returns: -1 if v1 < v2, 0 if v1 == v2, 1 if v1 > v2
+func (r *LiqoUpgradeReconciler) compareVersions(v1, v2 string) int {
+	// Remove 'v' prefix if present
+	v1 = strings.TrimPrefix(v1, "v")
+	v2 = strings.TrimPrefix(v2, "v")
+
+	// Simple string comparison for semantic versions
+	// This works for versions like "1.0.0", "1.0.1", etc.
+	parts1 := strings.Split(v1, ".")
+	parts2 := strings.Split(v2, ".")
+
+	// Compare each part
+	maxLen := len(parts1)
+	if len(parts2) > maxLen {
+		maxLen = len(parts2)
+	}
+
+	for i := 0; i < maxLen; i++ {
+		var p1, p2 int
+		if i < len(parts1) {
+			fmt.Sscanf(parts1[i], "%d", &p1)
+		}
+		if i < len(parts2) {
+			fmt.Sscanf(parts2[i], "%d", &p2)
+		}
+
+		if p1 < p2 {
+			return -1
+		} else if p1 > p2 {
+			return 1
+		}
+	}
+
+	return 0
 }
